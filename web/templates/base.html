@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}OmniRecon{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="shell">
+
+  <nav class="nav">
+    <div class="nav-logo">
+      <div class="brand">OmniRecon</div>
+      <div class="version">v7.0-dev</div>
+    </div>
+    <div class="nav-links">
+      <a href="/"         class="{{ 'active' if active == 'dashboard' }}"><span class="nav-icon">◈</span> Dashboard</a>
+      <a href="/scan"     class="{{ 'active' if active == 'scan' }}"><span class="nav-icon">⊕</span> New Scan</a>
+      <a href="/findings" class="{{ 'active' if active == 'findings' }}"><span class="nav-icon">⚠</span> Findings</a>
+      <a href="/assets"   class="{{ 'active' if active == 'assets' }}"><span class="nav-icon">◉</span> Assets</a>
+      <a href="/history"  class="{{ 'active' if active == 'history' }}"><span class="nav-icon">⊞</span> History</a>
+      <a href="/certs"    class="{{ 'active' if active == 'certs' }}"><span class="nav-icon">◎</span> Certs</a>
+      <a href="/reports"  class="{{ 'active' if active == 'reports' }}"><span class="nav-icon">⤓</span> Reports</a>
+    </div>
+  </nav>
+
+  <main class="main">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+        <div class="flash flash-{{ category }}">{{ message }}</div>
+      {% endfor %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+  </main>
+
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Reports — OmniRecon{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">Reports</div>
+  <div class="page-subtitle">Generated report artifacts (HTML · JSON · CSV · Markdown)</div>
+</div>
+
+<div class="card">
+  {% if files %}
+  <table>
+    <thead>
+      <tr><th>File</th><th>Type</th><th>Modified</th><th>Size</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for f in files %}
+      <tr>
+        <td>{{ f.name }}</td>
+        <td><span class="badge">{{ f.ext|upper }}</span></td>
+        <td class="text-sm text-muted">{{ f.mtime }}</td>
+        <td class="text-sm text-muted">{{ '%.1f'|format(f.size / 1024) }} KB</td>
+        <td><a href="/reports/{{ f.name }}" class="text-sm">{{ 'Open' if f.ext in ['html','json'] else 'Download' }} →</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">
+    <div class="empty-title">No reports yet</div>
+    <div><a href="/scan">Run a scan →</a> Reports are written to the reports/ directory.</div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

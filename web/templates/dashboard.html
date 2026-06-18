@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — OmniRecon{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">Dashboard</div>
+  <div class="page-subtitle">Network monitoring overview</div>
+</div>
+
+<!-- Stat cards -->
+<div class="stat-grid">
+  <div class="stat-card accent">
+    <div class="label">Total Assets</div>
+    <div class="value">{{ stats.total_assets }}</div>
+  </div>
+  <div class="stat-card {{ 'warning' if stats.unverified > 0 else '' }}">
+    <div class="label">Unverified</div>
+    <div class="value">{{ stats.unverified }}</div>
+  </div>
+  <div class="stat-card {{ 'danger' if stats.high_findings > 0 else '' }}">
+    <div class="label">High Findings</div>
+    <div class="value">{{ stats.high_findings }}</div>
+  </div>
+  <div class="stat-card {{ 'warning' if stats.certs_expiring > 0 else '' }}">
+    <div class="label">Certs Expiring</div>
+    <div class="value">{{ stats.certs_expiring }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Total Scans</div>
+    <div class="value">{{ stats.total_scans }}</div>
+  </div>
+</div>
+
+<!-- Posture score -->
+{% if score and not score.error %}
+<div class="score-card">
+  <div class="score-header">
+    <span class="score-title">Security Posture</span>
+    <span class="score-value">{{ score.overall }}/100</span>
+  </div>
+  {% for name, pct in score.dimensions.items() %}
+  <div class="score-row">
+    <span class="dim-name">{{ name }}</span>
+    <div class="bar-track">
+      <div class="bar-fill {{ 'danger' if pct < 50 else 'warn' if pct < 75 else '' }}"
+           style="width: {{ pct }}%"></div>
+    </div>
+    <span class="dim-pct">{{ pct }}%</span>
+  </div>
+  {% endfor %}
+  {% if score.note %}<div class="mt-8 text-sm text-muted">{{ score.note }}</div>{% endif %}
+</div>
+{% endif %}
+
+<div class="two-col">
+
+  <!-- Recent scans -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Recent Scans</span>
+      <a href="/history" class="text-sm">View all →</a>
+    </div>
+    {% if history %}
+    <table>
+      <thead>
+        <tr>
+          <th>Stamp</th>
+          <th>Hosts</th>
+          <th>Changes</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in history %}
+        <tr>
+          <td>{{ s.stamp }}</td>
+          <td>{{ s.host_count or 0 }}</td>
+          <td>
+            {% if s.high_count %}
+              <span class="badge badge-high">{{ s.high_count }} high</span>
+            {% endif %}
+            {% if s.delta_count %}{{ s.delta_count }} total{% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">
+      <div class="empty-title">No scans yet</div>
+      <div><a href="/scan">Run your first scan →</a></div>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Recent deltas -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Recent Changes</span>
+      <a href="/history" class="text-sm">View all →</a>
+    </div>
+    {% if deltas %}
+    <div class="delta-list">
+      {% for d in deltas %}
+      <div class="delta-item">
+        <span class="sev"><span class="badge badge-{{ d.severity }}">{{ d.severity }}</span></span>
+        <span class="desc">{{ d.summary }}</span>
+        <span class="meta">{{ d.ip or '' }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty">No changes detected yet.</div>
+    {% endif %}
+  </div>
+
+</div>
+{% endblock %}

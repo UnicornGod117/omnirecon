@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDEs
+.vscode/
+.idea/
+/.claude
+
+# Reports and output
+reports/
+network_report_*.json
+network_report_*.html
+cve_cache.json
+omnirecon_audit.jsonl
+
+# OS files
+.DS_Store
+Thumbs.db
+

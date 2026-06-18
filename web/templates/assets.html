@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Assets — OmniRecon{% endblock %}
+{% block content %}
+
+<div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-end;">
+  <div>
+    <div class="page-title">Assets</div>
+    <div class="page-subtitle">{{ assets|length }} known device(s)</div>
+  </div>
+  <div class="flex gap-8">
+    <a href="?filter=all"        class="btn btn-ghost btn-sm {{ 'btn-primary' if filter == 'all' }}">All</a>
+    <a href="?filter=unverified" class="btn btn-ghost btn-sm {{ 'btn-primary' if filter == 'unverified' }}">Unverified</a>
+    <a href="?filter=trusted"    class="btn btn-ghost btn-sm {{ 'btn-primary' if filter == 'trusted' }}">Trusted</a>
+    <a href="?filter=ignored"    class="btn btn-ghost btn-sm {{ 'btn-primary' if filter == 'ignored' }}">Ignored</a>
+  </div>
+</div>
+
+<div class="card mt-16">
+  {% if assets %}
+  <table>
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>IP</th>
+        <th>Identity Key</th>
+        <th>Name</th>
+        <th>Vendor</th>
+        <th>First Seen</th>
+        <th>Seen</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for a in assets %}
+      <tr>
+        <td><span class="badge badge-{{ a.status }}">{{ a.status }}</span></td>
+        <td>{{ a.ip or '—' }}</td>
+        <td><span class="text-muted">{{ a.mac or '—' }}</span></td>
+        <td>{{ a.device_name or '—' }}</td>
+        <td>{{ a.vendor or '—' }}</td>
+        <td class="text-muted">{{ (a.first_seen or '')[:10] }}</td>
+        <td>{{ a.seen_count }}</td>
+        <td>
+          {% if a.status == 'unverified' %}
+            <button class="btn btn-success btn-sm" data-action="ack"    data-key="{{ a.mac }}">Trust</button>
+            <button class="btn btn-ghost   btn-sm" data-action="ignore" data-key="{{ a.mac }}">Ignore</button>
+          {% elif a.status == 'trusted' %}
+            <button class="btn btn-ghost   btn-sm" data-action="ignore" data-key="{{ a.mac }}">Ignore</button>
+          {% elif a.status == 'ignored' %}
+            <button class="btn btn-success btn-sm" data-action="ack"    data-key="{{ a.mac }}">Trust</button>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">
+    <div class="empty-title">No assets recorded</div>
+    <div><a href="/scan">Run a scan to discover devices →</a></div>
+  </div>
+  {% endif %}
+</div>
+
+{% endblock %}

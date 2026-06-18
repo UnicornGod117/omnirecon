@@ -1,0 +1,257 @@
+{% extends "base.html" %}
+{% block title %}New Scan — OmniRecon{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">New Scan</div>
+  <div class="page-subtitle">Configure and launch a network scan</div>
+</div>
+
+<div class="scan-layout">
+
+  <!-- ── Config form ─────────────────────────────────────────────── -->
+  <div>
+    <form id="scan-form">
+
+      <!-- Scan type -->
+      <div class="option-group">
+        <div class="option-group-title">Scan Type</div>
+        <div class="form-group">
+          <select name="mode" id="mode-select" class="form-control">
+            <option value="monitor">Monitor — record over time (updates dashboard, history, deltas)</option>
+            <option value="onetime">One-Time — right now, stateless (pentest lives here)</option>
+          </select>
+          <div class="text-sm text-muted mt-4">
+            Monitor scans persist to the database and compute change deltas.
+            One-time scans are stateless unless you tick “save to monitor”.
+          </div>
+        </div>
+        <div class="checkbox-group" id="save-row" style="display:none;">
+          <label class="checkbox-item">
+            <input type="checkbox" name="save">
+            <span>Save to monitor</span>
+            <span class="hint">record this one-time run as a monitor baseline</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Target -->
+      <div class="option-group">
+        <div class="option-group-title">Target</div>
+
+        <div class="form-group">
+          <label>Subnet <span class="text-dim">(optional)</span></label>
+          <input name="subnet" class="form-control" placeholder="auto-detect  or  192.168.1.0/24">
+          <div class="text-sm text-muted mt-4">Leave blank to use all local interfaces. Comma-separate for multiple.</div>
+        </div>
+
+        <div class="form-group">
+          <label>Discovery Mode</label>
+          <select name="discovery_mode" class="form-control">
+            <option value="auto">auto — TCP on Windows, ICMP elsewhere</option>
+            <option value="arp">arp — ARP cache only (layer-2, fastest)</option>
+            <option value="icmp">icmp — ICMP ping sweep</option>
+            <option value="tcp">tcp — TCP connect on common ports</option>
+            <option value="udp">udp — UDP unreachable probe (needs root)</option>
+            <option value="combined">combined — TCP + ICMP + UDP (most thorough)</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Discovery options -->
+      <div class="option-group">
+        <div class="option-group-title">Discovery</div>
+        <div class="checkbox-group">
+          <label class="checkbox-item"><input type="checkbox" name="discover" checked>
+            <span>Host Discovery</span><span class="hint">find live hosts on the subnet</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="arp_prime">
+            <span>ARP Prime</span><span class="hint">pre-populate ARP cache before sweep</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="ipv6">
+            <span>IPv6</span><span class="hint">include IPv6 neighbors from NDP table</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="udp_probe">
+            <span>UDP Probe</span><span class="hint">detect hosts that block ICMP (needs root)</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="ttl_os">
+            <span>TTL OS Guess</span><span class="hint">infer OS from response TTL</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="passive">
+            <span>Passive Sniffing</span><span class="hint">listen for ARP/mDNS/SSDP/DHCP (needs root + scapy)</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="zeroconf">
+            <span>Zeroconf / mDNS</span><span class="hint">browse Bonjour/Avahi services</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="ssdp">
+            <span>SSDP / UPnP</span><span class="hint">discover UPnP devices</span></label>
+        </div>
+      </div>
+
+      <!-- Ports & services -->
+      <div class="option-group">
+        <div class="option-group-title">Ports &amp; Services</div>
+        <div class="checkbox-group">
+          <label class="checkbox-item"><input type="checkbox" name="probe_ports" checked>
+            <span>Port Scan</span><span class="hint">TCP probe common ports</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="service_hints">
+            <span>Service Hints</span><span class="hint">banners, TLS cert, HTTP titles</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="snmp">
+            <span>SNMP Probe</span><span class="hint">sysName / sysDescr via SNMP community</span></label>
+        </div>
+      </div>
+
+      <!-- Intelligence -->
+      <div class="option-group">
+        <div class="option-group-title">Intelligence</div>
+        <div class="checkbox-group">
+          <label class="checkbox-item"><input type="checkbox" name="cve_check">
+            <span>CVE Check</span><span class="hint">NVD lookup + CISA KEV</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="topology" checked>
+            <span>Topology Map</span><span class="hint">network graph in the report</span></label>
+        </div>
+        <div class="form-group" style="margin-top:10px;">
+          <label>CVE Minimum Score <span class="text-dim">(CVSS, 0.0–10.0)</span></label>
+          <input name="cve_min_score" class="form-control" value="6.0" style="max-width:100px;">
+        </div>
+      </div>
+
+      <!-- Pentest -->
+      <div class="option-group">
+        <div class="option-group-title">Penetration Testing</div>
+        <div class="checkbox-group">
+          <label class="checkbox-item">
+            <input type="checkbox" name="pentest" id="pentest-cb">
+            <span>Enable Pentest Module</span>
+            <span class="hint">active security checks on each host</span>
+          </label>
+        </div>
+        <div id="pentest-modules-row" class="form-group" style="margin-top:10px; display:none;">
+          <label>Modules <span class="text-dim">(comma-separated)</span></label>
+          <input name="pentest_modules" class="form-control" value="all"
+                 placeholder="all  or  tls-audit,headers,ftp-anon,ssh-defaults,smb-enum,http-vulns">
+          <div class="text-sm text-muted mt-4">
+            Available: <code>all</code>, <code>tls-audit</code>, <code>headers</code>,
+            <code>http-vulns</code>, <code>ftp-anon</code>, <code>ssh-defaults</code>, <code>smb-enum</code>
+          </div>
+        </div>
+      </div>
+
+      <!-- Authorization — prominent, at the bottom -->
+      <div class="option-group auth-group" id="auth-section">
+        <div class="option-group-title">Authorization</div>
+        <div class="auth-warning">
+          Active host discovery, port scanning, and pentest modules send probes to other
+          devices. Only scan networks you own or have <strong>explicit written authorization</strong>
+          to test. Unauthorized scanning may be illegal.
+        </div>
+        <label class="checkbox-item auth-item">
+          <input type="checkbox" name="i_have_authorization" id="auth-cb">
+          <span>I have authorization to scan this network</span>
+        </label>
+        <div id="auth-required-msg" class="text-sm" style="color:var(--danger); margin-top:6px; display:none;">
+          Authorization is required for host discovery and port scanning.
+        </div>
+      </div>
+
+      <!-- Output -->
+      <div class="option-group">
+        <div class="option-group-title">Output</div>
+        <div class="form-group">
+          <label>Output Directory</label>
+          <input name="outdir" class="form-control" value="reports">
+        </div>
+        <div class="form-group" style="margin-top:10px;">
+          <label>Extra Exports <span class="text-dim">(one-time, comma-separated)</span></label>
+          <input name="export" class="form-control" placeholder="csv,md" style="max-width:160px;">
+          <div class="text-sm text-muted mt-4">HTML + JSON are always written. Add <code>csv</code> and/or <code>md</code>.</div>
+        </div>
+        <div class="form-group" style="margin-top:10px;">
+          <label>Asset Tags File <span class="text-dim">(optional)</span></label>
+          <input name="tags_file" class="form-control" placeholder="reports/asset_tags.json">
+          <div class="text-sm text-muted mt-4">Maps IP/MAC → role/owner so findings know what's a server.</div>
+        </div>
+      </div>
+
+      <div class="flex gap-8 mt-16" style="align-items:center;">
+        <button id="start-btn" type="submit" class="btn btn-primary">▶ Start Scan</button>
+        <span id="scan-status" class="text-muted text-sm"></span>
+      </div>
+
+    </form>
+  </div>
+
+  <!-- ── Live terminal ────────────────────────────────────────────── -->
+  <div id="terminal-panel" style="display:none;">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Live Output</span>
+        <span id="scan-status-hdr" class="text-sm text-muted"></span>
+      </div>
+      <div class="terminal" id="terminal"></div>
+    </div>
+    <div class="mt-8 text-sm text-muted">
+      Scan is running in the background — safe to navigate. Come back to this page to see progress.
+    </div>
+  </div>
+
+</div><!-- /.scan-layout -->
+
+{% if token %}
+<div id="scan-token" data-token="{{ token }}" style="display:none;"></div>
+<script>document.getElementById('terminal-panel').style.display = 'block';</script>
+{% endif %}
+
+<style>
+.option-group {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+  margin-bottom: 12px;
+}
+.option-group-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+.auth-group {
+  border-color: var(--warning);
+}
+.auth-warning {
+  font-size: 11px;
+  color: var(--text-muted);
+  background: #1c1500;
+  border-left: 3px solid var(--warning);
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border-radius: 0 var(--radius) var(--radius) 0;
+  line-height: 1.5;
+}
+.auth-item { font-size: 13px; font-weight: 600; }
+.checkbox-item .hint { color: var(--text-dim); font-size: 11px; margin-left: 2px; }
+code { background: var(--surface2); padding: 1px 4px; border-radius: 3px; font-size: 10px; }
+</style>
+
+<script>
+// Show/hide pentest modules row
+document.getElementById('pentest-cb').addEventListener('change', function() {
+  document.getElementById('pentest-modules-row').style.display = this.checked ? 'block' : 'none';
+});
+
+// Show "save to monitor" only for one-time scans
+document.getElementById('mode-select').addEventListener('change', function() {
+  document.getElementById('save-row').style.display = this.value === 'onetime' ? 'block' : 'none';
+});
+
+// Show auth warning if user tries to start without checking authorization
+document.getElementById('scan-form').addEventListener('submit', function(e) {
+  const authCb = document.getElementById('auth-cb');
+  const discoverCb = document.querySelector('[name="discover"]');
+  const msg = document.getElementById('auth-required-msg');
+  if (!authCb.checked && discoverCb && discoverCb.checked) {
+    e.preventDefault();
+    msg.style.display = 'block';
+    document.getElementById('auth-section').scrollIntoView({behavior:'smooth'});
+    return;
+  }
+  msg.style.display = 'none';
+});
+</script>
+
+{% endblock %}

@@ -1,0 +1,10 @@
+{
+  "192.168.1.10": { "role": "fileserver", "owner": "infra", "label": "NAS" },
+  "192.168.1.1":  { "role": "gateway",    "owner": "infra" },
+  "aa:bb:cc:dd:ee:ff": { "role": "printer", "owner": "office" },
+  "_notes": {
+    "keys": "IP or MAC (case-insensitive). IP is matched first, then MAC.",
+    "role": "server-ish roles (server, fileserver, nas, infra, router, gateway, switch, hypervisor, dc) suppress 'management interface on a non-server' findings",
+    "usage": "copy to reports/asset_tags.json, or pass --tags-file / set it in the web Output panel"
+  }
+}

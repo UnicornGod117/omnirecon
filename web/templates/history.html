@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}History — OmniRecon{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">Scan History</div>
+  <div class="page-subtitle">{{ scans|length }} scan(s) recorded</div>
+</div>
+
+<div class="card">
+  {% if scans %}
+  <table>
+    <thead>
+      <tr>
+        <th>Stamp</th>
+        <th>Scanned At</th>
+        <th>Hosts</th>
+        <th>Changes</th>
+        <th>High</th>
+        <th>Medium</th>
+      </tr>
+    </thead>
+    {% for s in scans %}
+    <tbody>
+      <tr class="scan-row {{ 'open' if loop.first }}" data-scan-id="{{ s.id }}">
+        <td>{{ s.stamp }}</td>
+        <td>{{ (s.scanned_at or '')[:19].replace('T',' ') }}</td>
+        <td>{{ s.host_count or 0 }}</td>
+        <td>{{ s.delta_count or 0 }}</td>
+        <td>{% if s.high_count %}<span class="badge badge-high">{{ s.high_count }}</span>{% else %}—{% endif %}</td>
+        <td>{% if s.med_count %}<span class="badge badge-medium">{{ s.med_count }}</span>{% else %}—{% endif %}</td>
+      </tr>
+    </tbody>
+    <tbody id="sub-{{ s.id }}" class="delta-sub {{ 'open' if loop.first }}">
+      <tr><td colspan="6">
+        <div class="inner">
+          {% if s.deltas %}
+          <div class="delta-list">
+            {% for d in s.deltas %}
+            <div class="delta-item">
+              <span class="sev"><span class="badge badge-{{ d.severity }}">{{ d.severity }}</span></span>
+              <span class="desc">{{ d.summary }}</span>
+              <span class="meta">{{ d.ip or '' }}</span>
+            </div>
+            {% endfor %}
+          </div>
+          {% else %}
+          <span class="text-muted">No changes detected in this scan.</span>
+          {% endif %}
+        </div>
+      </td></tr>
+    </tbody>
+    {% endfor %}
+  </table>
+  {% else %}
+  <div class="empty">
+    <div class="empty-title">No scans yet</div>
+    <div><a href="/scan">Run your first scan →</a></div>
+  </div>
+  {% endif %}
+</div>
+
+{% endblock %}

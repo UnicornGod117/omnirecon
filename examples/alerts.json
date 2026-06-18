@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "min_severity": "medium",
+  "log": true,
+  "desktop": false,
+  "webhooks": [
+    { "url": "https://hooks.slack.com/services/XXX/YYY/ZZZ", "style": "slack" }
+  ],
+  "_notes": {
+    "min_severity": "high | medium | low | info — only deltas at or above this fire",
+    "style": "slack | discord | teams | mattermost | ntfy | json",
+    "usage": "copy to reports/alerts.json (or set $OMNIRECON_ALERTS) to activate"
+  }
+}

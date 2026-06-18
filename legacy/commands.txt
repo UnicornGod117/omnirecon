@@ -1,0 +1,147 @@
+============================================================
+  OmniRecon — Quick-reference command sheet
+  Run -h on either script for the full flag list:
+    python omnirecon.py -h
+    python omnirecon_lite.py -h
+============================================================
+
+
+════════════════════════════════════════════════════════════
+  SETUP  (do once)
+════════════════════════════════════════════════════════════
+
+# 1. Create a virtual environment (keeps packages isolated)
+python -m venv .venv
+
+# 2. Activate it
+.venv\Scripts\activate              # Windows PowerShell / CMD
+# source .venv/bin/activate         # macOS / Linux
+
+# 3. Install all dependencies
+pip install psutil requests scapy puresnmp zeroconf paramiko
+
+# 4. (Windows only) Install Npcap — required for Scapy raw sockets
+#    https://npcap.com/#download   ← tick "WinPcap API-compatible mode"
+
+# 5. Update the vendor OUI database (optional, improves MAC → vendor lookup)
+python update_oui.py
+
+
+════════════════════════════════════════════════════════════
+  ADMIN SHELL  (Windows — needed for raw sockets / Scapy)
+════════════════════════════════════════════════════════════
+
+# Open an elevated PowerShell in the current folder:
+Start-Process powershell -ArgumentList "-NoExit","-Command","Set-Location '$PWD'" -Verb RunAs
+
+# Or an elevated Windows Terminal:
+Start-Process wt -ArgumentList "-d `"$PWD`"" -Verb RunAs
+
+
+════════════════════════════════════════════════════════════
+  OMNIRECON LITE  (lightweight, no raw sockets needed)
+════════════════════════════════════════════════════════════
+
+# ── Tier 1: local device snapshot only (safe, no scanning) ──
+python omnirecon_lite.py --outdir .\reports
+
+# ── Tier 2: local info + discover all hosts on your LAN ──
+python omnirecon_lite.py --discover --outdir .\reports
+
+# ── Tier 3: discover + probe common ports on found hosts ──
+python omnirecon_lite.py --discover --probe-ports --outdir .\reports
+
+# ── Tier 4: EVERYTHING the lite version can do ──────────
+python omnirecon_lite.py --discover --probe-ports --workers 128 --outdir .\reports
+
+# ── Tier 4 targeting a specific subnet ──────────────────
+python omnirecon_lite.py --discover --subnet 192.168.1.0/24 --probe-ports --workers 128 --outdir .\reports
+
+
+════════════════════════════════════════════════════════════
+  OMNIRECON (full version)
+════════════════════════════════════════════════════════════
+
+# ── Tier 1: local device info only (no scanning at all) ──
+python omnirecon.py --outdir .\reports
+
+# ── Tier 2: standard LAN recon (safe default, no pentest) ──
+#    Discovers hosts, grabs banners, checks CVEs, builds topology map.
+python omnirecon.py --discover --probe-ports --service-hints --snmp --zeroconf --ssdp --arp-prime --ipv6 --ttl-os --cve-check --cve-kev --cve-min-score 6.0 --topology --progress --outdir .\reports
+
+# ── Tier 3: full passive + active recon, no pentest ─────
+#    Adds passive sniffing alongside active discovery.
+#    Run as administrator / root (raw socket needed for passive).
+python omnirecon.py --discover --discovery-mode combined --probe-ports --service-hints --snmp --zeroconf --ssdp --arp-prime --ipv6 --udp-probe --ttl-os --passive --cve-check --cve-kev --cve-min-score 0.0 --topology --progress --outdir .\reports
+
+# ── Tier 4: MAXIMUM — everything (recon + full pentest) ─
+#    Requires admin/root AND written authorisation to test the network.
+#    You will be prompted to type "I CONSENT" at runtime.
+python omnirecon.py --discover --discovery-mode combined --probe-ports --service-hints --snmp --zeroconf --ssdp --arp-prime --ipv6 --udp-probe --ttl-os --passive --cve-check --cve-kev --cve-min-score 0.0 --topology --pentest --pentest-modules all --i-have-authorization --progress --outdir .\reports
+
+# ── Passive-only mode (listen, no active probing) ────────
+#    Captures what's already on the wire; nothing is sent.
+python omnirecon.py --passive-extended --passive-duration 60 --outdir .\reports
+
+# ── Single specific subnet ────────────────────────────────
+python omnirecon.py --discover --subnet 192.168.1.0/24 --probe-ports --service-hints --snmp --zeroconf --ssdp --arp-prime --ttl-os --cve-check --cve-kev --topology --progress --outdir .\reports
+
+# ── Non-RFC1918 / public targets (use responsibly) ───────
+python omnirecon.py --discover --subnet 10.0.0.0/24 --allow-non-private --probe-ports --service-hints --cve-check --topology --progress --outdir .\reports
+
+
+════════════════════════════════════════════════════════════
+  PENTEST MODULES  (--pentest-modules flag)
+════════════════════════════════════════════════════════════
+#  all          → run every module below
+#  tls-audit    → check TLS protocol versions & weak ciphers
+#  headers      → HTTP security-header audit (HSTS, CSP, …)
+#  http-vulns   → probe 25+ sensitive paths (.env, .git/HEAD, …)
+#  ftp-anon     → test for anonymous FTP login
+#  ssh-defaults → try common default credentials over SSH
+#  smb-enum     → SMB null-session / guest share enumeration
+
+# Example — TLS + headers only, skipping credential tests:
+python omnirecon.py --discover --probe-ports --service-hints --pentest --pentest-modules tls-audit,headers --i-have-authorization --outdir .\reports
+
+
+════════════════════════════════════════════════════════════
+  USEFUL ONE-LINERS
+════════════════════════════════════════════════════════════
+
+# Quick "what's on my LAN right now?" (no install required beyond psutil+requests)
+python omnirecon_lite.py --discover --probe-ports --outdir .\reports
+
+# Refresh CVE cache after NVD updates
+python omnirecon.py --discover --cve-check --cve-kev --outdir .\reports
+
+# Pull full help for a specific topic
+python omnirecon.py --help-topic pentest
+python omnirecon.py --help-topic cve-check
+python omnirecon.py --help-topic passive
+
+
+════════════════════════════════════════════════════════════
+  COMMON ERROR FIXES
+════════════════════════════════════════════════════════════
+
+ModuleNotFoundError: No module named 'psutil'
+  → pip install psutil
+
+ModuleNotFoundError: No module named 'requests'
+  → pip install requests
+
+ModuleNotFoundError: No module named 'scapy'
+  → pip install scapy   (also needs Npcap on Windows)
+
+ModuleNotFoundError: No module named 'zeroconf'
+  → pip install zeroconf
+
+ModuleNotFoundError: No module named 'puresnmp'
+  → pip install puresnmp
+
+ModuleNotFoundError: No module named 'paramiko'
+  → pip install paramiko
+
+"Operation not permitted" / "Access denied" on raw sockets
+  → Re-run from an admin / root shell (see ADMIN SHELL section above)

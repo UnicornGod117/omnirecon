@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Findings — OmniRecon{% endblock %}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">Security Findings</div>
+  <div class="page-subtitle">Network hygiene &amp; exposure from the latest recorded scan</div>
+</div>
+
+{% if not have_report %}
+<div class="empty">
+  <div class="empty-title">No scan report available</div>
+  <div><a href="/scan">Run a scan →</a> Findings appear after a monitor scan or a saved one-time scan.</div>
+</div>
+{% else %}
+
+{% set counts = summary.get('counts', {}) %}
+<div class="stat-grid">
+  <div class="stat-card accent">
+    <div class="label">Posture</div>
+    <div class="value">{{ summary.get('grade') or '—' }} <span class="text-sm text-muted">{{ summary.get('score') or 0 }}/100</span></div>
+  </div>
+  <div class="stat-card {{ 'danger' if (counts.get('high') or 0) > 0 else '' }}">
+    <div class="label">High</div>
+    <div class="value">{{ counts.get('high') or 0 }}</div>
+  </div>
+  <div class="stat-card {{ 'warning' if (counts.get('medium') or 0) > 0 else '' }}">
+    <div class="label">Medium</div>
+    <div class="value">{{ counts.get('medium') or 0 }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Low</div>
+    <div class="value">{{ counts.get('low') or 0 }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Info</div>
+    <div class="value">{{ counts.get('info') or 0 }}</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="card-title">Findings ({{ findings|length }})</span></div>
+  {% if findings %}
+  <table>
+    <thead>
+      <tr><th>Severity</th><th>Category</th><th>Host</th><th>Finding</th><th>Recommendation</th></tr>
+    </thead>
+    <tbody>
+      {% for f in findings %}
+      <tr>
+        <td><span class="badge badge-{{ f.severity }}">{{ f.severity }}</span></td>
+        <td>{{ f.category }}</td>
+        <td>{{ f.ip or '—' }}</td>
+        <td><strong>{{ f.title }}</strong><br><span class="text-sm text-muted">{{ f.detail }}</span></td>
+        <td class="text-sm">{{ f.recommendation }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty"><div class="empty-title">No hygiene issues detected ✓</div></div>
+  {% endif %}
+</div>
+
+{% endif %}
+{% endblock %}
