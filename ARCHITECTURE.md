@@ -61,23 +61,34 @@ omnirecon/                    repo root
 │  │  ├─ discovery.py           ping sweep + ARP/vendor/rDNS/is-self enrichment
 │  │  ├─ ports.py               threaded TCP port scan
 │  │  ├─ enrichment.py          service hints: banner · TLS cert · HTTP title
+│  │  ├─ tls.py                 stdlib TLS cert retrieval/parsing (shared)
+│  │  ├─ snmp.py                SNMP sysName/sysDescr enrichment (opt, puresnmp)
+│  │  ├─ ssdp.py                SSDP/UPnP active discovery (pure socket)
+│  │  ├─ zeroconf_disc.py       Zeroconf/mDNS browse (opt, zeroconf)
+│  │  ├─ passive.py             passive sniff harvest (opt, scapy; privileged)
+│  │  ├─ topology.py            gateway-centric network graph (nodes + edges)
 │  │  ├─ intel.py               CVE/NVD + CISA KEV correlation (opt-in)
+│  │  ├─ extintel.py            Shodan/Censys/VirusTotal lookup of public IPs (opt-in)
 │  │  ├─ hygiene.py             derived findings + exposure map + posture grade
 │  │  ├─ tags.py                asset role/owner annotations (optional file)
-│  │  ├─ report.py              normalized schema + HTML/JSON/CSV/Markdown writers
+│  │  ├─ plugins.py             user-droppable analysis/active check loader
+│  │  ├─ report.py              normalized schema + HTML/JSON/CSV/MD/PDF writers
 │  │  └─ engine.py              run_engine(EngineOptions, callbacks) → report
 │  │
 │  ├─ monitor/                ── MODE 1 · over time (persistent) ──
 │  │  ├─ store.py               SQLite: scans · assets · snapshots · certs · deltas
+│  │  ├─ scan.py                run_monitored_scan: scan → record → diff → alert
 │  │  ├─ score.py               posture scoring
-│  │  ├─ alerts.py              webhook · desktop · log on qualifying deltas
-│  │  └─ cli.py                 secondary CLI: monitor scan|history|diff|ack|…|alerts
+│  │  ├─ rules.py               YAML/JSON alert policies (suppress · re-rate · route)
+│  │  ├─ alerts.py              log · webhook · desktop · email on qualifying deltas
+│  │  ├─ schedule.py            OS scheduler (schtasks/cron) register + daemon loop
+│  │  └─ cli.py                 secondary CLI: monitor scan|history|diff|…|daemon|schedule
 │  │
 │  ├─ onetime/                ── MODE 2 · right now (stateless) ──
 │  │  ├─ scan.py                deep one-shot orchestration (+ optional --save bridge)
 │  │  ├─ pentest/               aggressive suite (authorization-gated)
 │  │  │  ├─ runner.py · tls_audit.py · http_checks.py · services.py
-│  │  └─ cli.py                 secondary CLI: scan …
+│  │  └─ cli.py                 secondary CLI: scan …  (+ active plugins live here)
 │  │
 │  └─ cli.py                  secondary/automation entry: `python -m omnirecon`
 │
@@ -87,6 +98,8 @@ omnirecon/                    repo root
 │  ├─ templates/                Dashboard · Scan · Findings · Assets · History · Certs · Reports
 │  └─ static/                   CSS + JS
 │
+├─ plugins/                    user-droppable checks (analysis + active) · examples
+├─ tests/                      pytest suite (offline) — separate from the app body
 ├─ lite/                       ▓▓ LITE program ▓▓  — standalone sharp TUI + mini-engine
 ├─ legacy/                     ▓▓ FROZEN ▓▓ — reference only
 └─ reports/                    output dir (reports + omnirecon.db)
@@ -106,6 +119,10 @@ The MAIN program is `omnirecon/` (logic) + `web/` (its browser interface). The c
 6. **The CLI is secondary.** It mirrors what the web does for automation and scheduled monitor scans; it is never the only way to do something.
 7. **Lite is independent.** Its own lightweight engine, minimal deps, never depends on the brain. Stays runnable as a standalone TUI.
 8. **Legacy is cold.** Nothing in the main program imports or launches `legacy/`.
+9. **Plugins respect the seams.** Analysis plugins are pure (no I/O), run inside the engine, and fold into hygiene — so they work in monitor mode. Active plugins probe the network and therefore run in **one-time only**; if they declare `requires_authorization` they are skipped without the consent flag, exactly like pentest. A broken plugin is swallowed, never aborts a scan.
+10. **External intel is opt-in network I/O over public IPs only.** `extintel.py` only ever queries routable addresses (the host's public IP and any non-RFC1918 host) — private/LAN targets are never sent to third parties. No API key → the provider is silently skipped.
+11. **Rules and scheduling are monitor-only.** The rule engine post-processes deltas (suppress / re-rate / route) before alerts fire; with no rules file, the classic `min_severity` broadcast is unchanged. Scheduling hands a `monitor scan` to the OS scheduler (or a foreground daemon loop) — a one-time scan never schedules itself.
+12. **Optional dependencies degrade gracefully.** Everything beyond the stdlib core (Flask, scapy, puresnmp, zeroconf, plyer, paramiko, PyYAML, WeasyPrint, …) is optional; a missing library disables exactly its feature with a note, never breaks the program. See `pyproject.toml` extras.
 
 ---
 
@@ -155,7 +172,17 @@ Every engine run yields this shape. The monitor store, the web views, and the re
       "http_vulns": { "443": […] },
       "ftp_anon":   {…}, "ssh_defaults": {…}, "smb_enum": {…}
     }
-  }
+  },
+  "external_intel": {                    // present only when extintel ran (opt-in)
+    "by_ip":   { "93.184.216.34": { "shodan": {…}, "virustotal": {…}, "censys": {…} } },
+    "findings": [ … ],                   // also folded into hygiene
+    "providers": ["shodan", "virustotal"], "queried": ["93.184.216.34"]
+  },
+  "plugins": {                           // present only for one-time runs with plugins
+    "active": { "http-banner": { "192.168.1.10": { "server_banners": {"443": "…"} } } },
+    "skipped": ["aggressive-plugin"]     // active plugins that needed authorization
+  },
+  "plugin_findings": [ … ]               // analysis-plugin findings (also folded into hygiene)
 }
 ```
 
@@ -174,10 +201,18 @@ Asset identity is **MAC-keyed** (`ip:<addr>` fallback) so a device is tracked ac
 
 ┌─ MAIN (secondary CLI, for automation / cron) ──────────────────────────┐
 │  omnirecon scan [--service-hints] [--cve] [--pentest all --i-have-…]    │
+│  omnirecon scan --plugins --extintel --export pdf,csv   # plugins+intel  │
+│  omnirecon scan --list-plugins          # what's in ./plugins            │
 │  omnirecon scan --save                  # seed the monitor baseline      │
-│  omnirecon monitor scan                 # scheduled persistent scan      │
+│  omnirecon monitor scan [--plugins] [--extintel]   # persistent scan     │
 │  omnirecon monitor history|diff|ack|certs|assets|score                  │
+│  omnirecon monitor daemon --interval 6h            # foreground loop      │
+│  omnirecon monitor schedule add --interval 6h      # OS scheduled job     │
+│  omnirecon monitor schedule list|remove                                 │
 └─────────────────────────────────────────────────────────────────────────┘
+
+  Alert policy (monitor): drop a rules.yaml in .omnirecon/ to suppress,
+  re-rate, or route deltas to log/webhook/desktop/email channels.
 
 ┌─ LITE (standalone) ── python -m lite ──────────────────────────────────┐
 │  Sharp Textual TUI (CLI fallback). Quick snapshot, no DB, no pentest.   │

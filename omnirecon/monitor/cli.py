@@ -97,11 +97,11 @@ def _delta_line(d: dict) -> str:
 
 # ── Subcommands ───────────────────────────────────────────────────────────────
 
-def cmd_scan(args) -> None:
+def _build_scan_opts(args) -> EngineOptions:
     subnets: List[str] = []
-    if args.subnet:
+    if getattr(args, "subnet", None):
         subnets = [s.strip() for s in args.subnet.split(",") if s.strip()]
-    opts = EngineOptions(
+    return EngineOptions(
         subnets=subnets,
         discover=True,
         probe_ports=not args.no_ports,
@@ -118,7 +118,13 @@ def cmd_scan(args) -> None:
         cve_min_score=args.cve_min_score,
         topology=args.topology,
         tags_file=getattr(args, "tags_file", None),
+        extintel=getattr(args, "extintel", False),
+        plugins=getattr(args, "plugins", False),
     )
+
+
+def cmd_scan(args) -> None:
+    opts = _build_scan_opts(args)
 
     def stage(name: str) -> None:
         print(f"  [{name}]")
@@ -258,6 +264,72 @@ def cmd_alerts(args) -> None:
         print()
 
 
+def cmd_schedule(args) -> None:
+    from . import schedule as sched
+    action = getattr(args, "action", None)
+
+    if action == "list":
+        jobs = sched.list_jobs()
+        if not jobs:
+            print("\n  No scheduled OmniRecon jobs.\n")
+            return
+        print(f"\n  {'NAME':<16}  {'SCHEDULE':<22}  STATUS\n  {'─'*54}")
+        for j in jobs:
+            when = j.get("cron") or j.get("next_run") or ""
+            print(f"  {j.get('name',''):<16}  {when:<22}  {j.get('status','')}")
+        print()
+        return
+
+    if action == "remove":
+        res = sched.remove(args.name)
+        print(f"\n  {'Removed' if res.get('ok') else 'Failed'}: "
+              f"{res.get('name') or res.get('task') or args.name}"
+              f"{'' if res.get('ok') else '  — ' + res.get('error','')}\n")
+        sys.exit(0 if res.get("ok") else 1)
+
+    # default action: add
+    interval = None
+    if getattr(args, "interval", None):
+        try:
+            interval = sched.parse_interval(args.interval)
+        except ValueError as e:
+            print(f"\n  {e}\n")
+            sys.exit(2)
+    res = sched.register(
+        name=args.name, interval=interval, cron=getattr(args, "cron", None),
+        at=getattr(args, "at", None), db=args.db, subnet=getattr(args, "subnet", None),
+    )
+    if not res.get("ok"):
+        print(f"\n  Could not register job: {res.get('error')}\n")
+        sys.exit(1)
+    where = res.get("scheduler", "scheduler")
+    when = res.get("cron") or (args.interval or args.at or "daily 02:00")
+    print(f"\n  Registered '{args.name}' with {where} ({when}).")
+    print(f"  Command: {res.get('command')}\n")
+
+
+def cmd_daemon(args) -> None:
+    from . import schedule as sched
+    try:
+        interval = sched.parse_interval(args.interval)
+    except ValueError as e:
+        print(f"\n  {e}\n")
+        sys.exit(2)
+    opts = _build_scan_opts(args)
+
+    def stage(name: str) -> None:
+        print(f"  [{name}]")
+
+    def run_once() -> None:
+        result = run_monitored_scan(opts, args.db, _DEFAULT_OUT, stage_cb=stage)
+        print(f"  → {result['stamp']}: {result['host_count']} host(s), "
+              f"{result['delta_count']} change(s).")
+
+    print(f"\n  OmniRecon daemon — scanning every {args.interval}. Ctrl-C to stop.\n")
+    runs = sched.daemon(run_once, interval, stage_cb=stage)
+    print(f"\n  Daemon stopped after {runs} run(s).\n")
+
+
 def cmd_score(store, args) -> None:
     result = score_mod.compute(store)
     if "error" in result:
@@ -274,9 +346,8 @@ def cmd_score(store, args) -> None:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def build_parser(sub) -> None:
-    """Attach monitor subcommands to a parent subparser (the top-level CLI)."""
-    p = sub.add_parser("scan", help="Run a scan, record it, and compute deltas")
+def _add_scan_args(p) -> None:
+    """Engine/scan flags shared by `monitor scan` and `monitor daemon`."""
     p.add_argument("--subnet", metavar="CIDR")
     p.add_argument("--no-ports", action="store_true")
     p.add_argument("--discovery-mode", default="auto",
@@ -292,7 +363,34 @@ def build_parser(sub) -> None:
     p.add_argument("--cve-min-score", type=float, default=6.0)
     p.add_argument("--topology", action="store_true")
     p.add_argument("--tags-file", metavar="PATH", default=None)
+    p.add_argument("--extintel", action="store_true",
+                   help="external intel (Shodan/Censys/VirusTotal)")
+    p.add_argument("--plugins", action="store_true",
+                   help="run analysis plugins (folded into hygiene)")
+
+
+def build_parser(sub) -> None:
+    """Attach monitor subcommands to a parent subparser (the top-level CLI)."""
+    p = sub.add_parser("scan", help="Run a scan, record it, and compute deltas")
+    _add_scan_args(p)
     p.set_defaults(func=cmd_scan, needs_store=False)
+
+    p = sub.add_parser("daemon", help="Foreground loop: re-scan every interval")
+    p.add_argument("--interval", default="6h",
+                   help="time between scans, e.g. 30m, 6h, 1d (default 6h)")
+    _add_scan_args(p)
+    p.set_defaults(func=cmd_daemon, needs_store=False)
+
+    p = sub.add_parser("schedule", help="Register/list/remove an OS scheduled scan")
+    p.add_argument("action", nargs="?", default="add",
+                   choices=["add", "list", "remove"], help="default: add")
+    p.add_argument("--name", default="default", help="job name (default: default)")
+    p.add_argument("--interval", default=None, help="e.g. 30m, 6h, 1d")
+    p.add_argument("--cron", default=None, metavar="EXPR",
+                   help='5-field cron, e.g. "0 */6 * * *"')
+    p.add_argument("--at", default=None, metavar="HH:MM", help="daily time")
+    p.add_argument("--subnet", default=None, metavar="CIDR")
+    p.set_defaults(func=cmd_schedule, needs_store=False)
 
     p = sub.add_parser("history", help="Show scan history")
     p.add_argument("--limit", type=int, default=20)

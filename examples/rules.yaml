@@ -1,0 +1,39 @@
+# OmniRecon alert rules.
+#
+# Copy to .omnirecon/rules.yaml or reports/rules.yaml (or point $OMNIRECON_RULES
+# at it). Requires PyYAML for the YAML form; a JSON file with the same shape
+# works without it. The first rule that matches a delta wins; deltas matching no
+# rule fall back to the global min_severity broadcast.
+#
+# Each rule's `alert:` list also has to be backed by a configured channel in your
+# alerts.json (webhooks/desktop/email). Rules pick *which* configured channels
+# fire — they don't create channels.
+
+rules:
+  # Any brand-new device is high severity and should hit log + webhook.
+  - name: "New device on network"
+    trigger: new_device
+    severity: high
+    alert: [log, webhook]
+
+  # Quietly ignore everything on the guest VLAN.
+  - name: "Ignore guest VLAN"
+    trigger: new_device
+    match:
+      subnet: "192.168.10.0/24"
+    action: suppress
+
+  # A management port appearing on a device that isn't a server is suspicious.
+  - name: "SSH/RDP exposed on non-server"
+    trigger: new_service
+    match:
+      port: 22
+      asset_role: "!server"
+    severity: medium
+    alert: [log]
+
+  # Only nag about certs once they're inside 30 days.
+  - name: "Certificate expiring soon"
+    trigger: cert_expiry
+    threshold_days: 30
+    alert: [webhook, email]

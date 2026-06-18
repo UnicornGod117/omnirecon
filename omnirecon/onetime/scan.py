@@ -51,10 +51,26 @@ def run_onetime_scan(
             from ..engine import hygiene as _hygiene
             report["hygiene"] = _hygiene.analyze(report)
 
+    # Active plugins probe hosts over the network — one-time mode only.
+    if opts.plugins and hosts:
+        if stage_cb:
+            stage_cb("Running active plugins")
+        from ..engine import plugins as plugins_mod
+        active = plugins_mod.run_active(
+            hosts, authorized=authorized, dirs=opts.plugin_dirs,
+            names=opts.plugin_names, stage_cb=stage_cb)
+        if active.get("results"):
+            report.setdefault("plugins", {})["active"] = active["results"]
+        if active.get("skipped"):
+            report.setdefault("plugins", {})["skipped"] = active["skipped"]
+        if active.get("findings") and opts.hygiene:
+            from ..engine import hygiene as _hygiene
+            _hygiene.fold_in_findings(report, active["findings"])
+
     html_path, json_path = report_mod.write_reports(report, outdir, prefix="scan")
 
     extra_exports: Dict[str, str] = {}
-    wanted = [f for f in (export or []) if f in ("csv", "md")]
+    wanted = [f for f in (export or []) if f in ("csv", "md", "pdf")]
     if wanted:
         if stage_cb:
             stage_cb(f"Exporting {', '.join(wanted)}")

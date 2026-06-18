@@ -250,6 +250,21 @@ def _grade(score: int) -> str:
             else "D" if score >= 60 else "F")
 
 
+def _summarize(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Count, score, and grade a findings list. Sorts findings in place."""
+    counts = {"high": 0, "medium": 0, "low": 0, "info": 0}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    score = 100
+    for sev, n in counts.items():
+        score -= _SEV_PENALTY.get(sev, 0) * n
+    score = max(0, min(100, score))
+    order = {"high": 0, "medium": 1, "low": 2, "info": 3}
+    findings.sort(key=lambda f: (order.get(f["severity"], 9), f.get("category", "")))
+    return {"counts": counts, "score": score, "grade": _grade(score),
+            "total": len(findings)}
+
+
 def analyze(report: Dict[str, Any]) -> Dict[str, Any]:
     hosts = (report.get("discovery") or {}).get("hosts", [])
 
@@ -269,21 +284,28 @@ def analyze(report: Dict[str, Any]) -> Dict[str, Any]:
     findings.extend(_local_findings(report))
     findings.extend(_pentest_findings(report))
 
-    counts = {"high": 0, "medium": 0, "low": 0, "info": 0}
-    for f in findings:
-        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
-
-    score = 100
-    for sev, n in counts.items():
-        score -= _SEV_PENALTY.get(sev, 0) * n
-    score = max(0, min(100, score))
-
-    order = {"high": 0, "medium": 1, "low": 2, "info": 3}
-    findings.sort(key=lambda f: (order.get(f["severity"], 9), f.get("category", "")))
-
     return {
         "findings": findings,
         "by_host": by_host,
-        "summary": {"counts": counts, "score": score, "grade": _grade(score),
-                    "total": len(findings)},
+        "summary": _summarize(findings),
     }
+
+
+def fold_in_findings(report: Dict[str, Any],
+                     extra: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge externally produced findings (plugins, external intel) into the
+    existing hygiene block and recompute the summary + per-host risk notes, so
+    the grade reflects them. No-op if hygiene hasn't run."""
+    hyg = report.get("hygiene")
+    if not isinstance(hyg, dict) or not extra:
+        return report.get("hygiene", {})
+    findings = hyg.setdefault("findings", [])
+    by_host = hyg.setdefault("by_host", {})
+    for f in extra:
+        findings.append(f)
+        ip = f.get("ip")
+        if ip and ip in by_host:
+            by_host[ip].setdefault("findings", []).append(f)
+            by_host[ip].setdefault("risk_notes", []).append(f.get("title", ""))
+    hyg["summary"] = _summarize(findings)
+    return hyg

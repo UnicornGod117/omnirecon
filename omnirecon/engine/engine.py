@@ -62,6 +62,12 @@ class EngineOptions:
     # Analysis
     hygiene: bool = True                  # derived findings + exposure (free)
     tags_file: Optional[str] = None       # asset tags (None → default search paths)
+    plugins: bool = False                 # run user analysis plugins (folded into hygiene)
+    plugin_dirs: Optional[List[str]] = None  # override plugin search dirs
+    plugin_names: Optional[List[str]] = None  # restrict to named plugins
+    # External intelligence (opt-in, network I/O — like CVE correlation)
+    extintel: bool = False                # Shodan/Censys/VirusTotal enrichment
+    extintel_config: Optional[str] = None  # path to keys config (None → default search)
 
 
 def _merge_passive(hosts: List[Dict[str, Any]], passive_hosts: List[Dict[str, Any]],
@@ -214,5 +220,25 @@ def run_engine(opts: EngineOptions, stage_cb: StageCb = None,
     if opts.hygiene:
         stage("Analyzing hygiene & exposure")
         report["hygiene"] = hygiene.analyze(report)
+
+    # External intelligence (opt-in network I/O against public IPs).
+    if opts.extintel and hosts:
+        stage("Querying external intel (Shodan / Censys / VirusTotal)")
+        from . import extintel
+        ext = extintel.enrich(report, config_path=opts.extintel_config, stage_cb=stage_cb)
+        if ext.get("by_ip"):
+            report["external_intel"] = ext
+            if opts.hygiene and ext.get("findings"):
+                hygiene.fold_in_findings(report, ext["findings"])
+
+    # Analysis plugins (pure, read-only) — folded into hygiene so they grade.
+    if opts.plugins:
+        from . import plugins as plugins_mod
+        pl = plugins_mod.run_analysis(report, dirs=opts.plugin_dirs,
+                                      names=opts.plugin_names, stage_cb=stage_cb)
+        if pl:
+            report["plugin_findings"] = pl
+            if opts.hygiene:
+                hygiene.fold_in_findings(report, pl)
 
     return report

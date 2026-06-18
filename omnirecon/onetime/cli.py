@@ -48,6 +48,19 @@ def build_parser(p) -> None:
     p.add_argument("--cve", action="store_true", help="correlate CVEs (NVD + CISA KEV)")
     p.add_argument("--cve-min-score", type=float, default=6.0)
     p.add_argument("--topology", action="store_true", help="build topology map")
+    p.add_argument("--extintel", action="store_true",
+                   help="external intel: Shodan/Censys/VirusTotal (needs API keys)")
+    p.add_argument("--extintel-config", metavar="PATH", default=None,
+                   help="external-intel keys file (default: reports/extintel.json)")
+    # Plugins
+    p.add_argument("--plugins", action="store_true",
+                   help="run user plugins (analysis + active)")
+    p.add_argument("--plugin", action="append", metavar="NAME", default=None,
+                   help="restrict to a named plugin (repeatable)")
+    p.add_argument("--plugin-dir", action="append", metavar="DIR", default=None,
+                   help="extra plugin search directory (repeatable)")
+    p.add_argument("--list-plugins", action="store_true",
+                   help="list discoverable plugins and exit")
     # Pentest
     p.add_argument("--pentest", nargs="?", const="all", metavar="MODULES",
                    help=f"run pentest suite ({', '.join(ALL_MODULES)}, or 'all')")
@@ -56,7 +69,7 @@ def build_parser(p) -> None:
     p.add_argument("--save", action="store_true",
                    help="record this run into the monitor store (seed a baseline)")
     p.add_argument("--export", metavar="FORMATS", default="",
-                   help="extra report formats, comma-separated: csv,md")
+                   help="extra report formats, comma-separated: csv,md,pdf")
     p.add_argument("--tags-file", metavar="PATH", default=None,
                    help="asset tags file (role/owner annotations)")
     p.add_argument("--outdir", default=_DEFAULT_OUT, metavar="DIR")
@@ -64,6 +77,20 @@ def build_parser(p) -> None:
 
 
 def cmd_scan(args) -> None:
+    if getattr(args, "list_plugins", False):
+        from ..engine import plugins as plugins_mod
+        found = plugins_mod.list_plugins(getattr(args, "plugin_dir", None))
+        if not found:
+            print("\n  No plugins found. Drop *.py into ./plugins or set "
+                  "$OMNIRECON_PLUGINS.\n")
+            return
+        print("\n  Discoverable plugins:\n")
+        for p in found:
+            auth = "  [needs authorization]" if p["requires_authorization"] == "true" else ""
+            print(f"    {p['name']:<22} {p['kind']:<9} {p['description']}{auth}")
+        print()
+        return
+
     subnets: List[str] = []
     if getattr(args, "subnet", None):
         subnets = [s.strip() for s in args.subnet.split(",") if s.strip()]
@@ -96,6 +123,11 @@ def cmd_scan(args) -> None:
         cve_min_score=args.cve_min_score,
         topology=args.topology,
         tags_file=args.tags_file,
+        extintel=args.extintel,
+        extintel_config=args.extintel_config,
+        plugins=args.plugins,
+        plugin_dirs=args.plugin_dir,
+        plugin_names=args.plugin,
     )
 
     def stage(name: str) -> None:

@@ -102,6 +102,10 @@
             <span>CVE Check</span><span class="hint">NVD lookup + CISA KEV</span></label>
           <label class="checkbox-item"><input type="checkbox" name="topology" checked>
             <span>Topology Map</span><span class="hint">network graph in the report</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="extintel">
+            <span>External Intel</span><span class="hint">Shodan/Censys/VirusTotal (needs API keys)</span></label>
+          <label class="checkbox-item"><input type="checkbox" name="plugins">
+            <span>Plugins</span><span class="hint">run analysis + active plugins from ./plugins</span></label>
         </div>
         <div class="form-group" style="margin-top:10px;">
           <label>CVE Minimum Score <span class="text-dim">(CVSS, 0.0–10.0)</span></label>
@@ -156,8 +160,8 @@
         </div>
         <div class="form-group" style="margin-top:10px;">
           <label>Extra Exports <span class="text-dim">(one-time, comma-separated)</span></label>
-          <input name="export" class="form-control" placeholder="csv,md" style="max-width:160px;">
-          <div class="text-sm text-muted mt-4">HTML + JSON are always written. Add <code>csv</code> and/or <code>md</code>.</div>
+          <input name="export" class="form-control" placeholder="csv,md,pdf" style="max-width:160px;">
+          <div class="text-sm text-muted mt-4">HTML + JSON are always written. Add <code>csv</code>, <code>md</code>, and/or <code>pdf</code> (PDF needs WeasyPrint or wkhtmltopdf).</div>
         </div>
         <div class="form-group" style="margin-top:10px;">
           <label>Asset Tags File <span class="text-dim">(optional)</span></label>

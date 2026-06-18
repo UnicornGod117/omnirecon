@@ -1,0 +1,8 @@
+{
+  "_comment": "External-intel API keys. Copy to reports/extintel.json (or point $OMNIRECON_EXTINTEL at it) and fill in whichever providers you have. Leave a key blank to skip that provider. Only PUBLIC IPs are ever queried; private/LAN addresses are never sent to third parties.",
+  "shodan_api_key": "",
+  "censys_api_id": "",
+  "censys_api_secret": "",
+  "virustotal_api_key": "",
+  "max_targets": 8
+}

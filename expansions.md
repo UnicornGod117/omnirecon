@@ -14,15 +14,20 @@ Already shipped in the current build (`omnirecon/` + `web/` + `lite/`):
 - **Exposure mapping + posture grade** — per-host service grouping and an A–F report card derived from findings.
 - **Asset tags** — `engine/tags.py` + `--tags-file`: IP/MAC → role/owner annotations (`examples/asset_tags.json`).
 - **Enhanced reporting** — dark-mode self-contained HTML with an executive summary (grade, severity distribution, device-type breakdown, top issues), findings table, and exposure map. **CSV + Markdown** export (`--export csv,md`).
-- **Alerting** — `monitor/alerts.py`: webhook (Slack/Discord/Teams/ntfy), desktop toast, and always-on `reports/alerts.log` on qualifying deltas (`examples/alerts.json`, `monitor alerts --test`).
-- **Web front door** — Dashboard, Findings, Assets, History, Certs, Reports (download HTML/JSON/CSV/MD), live-streamed scans.
+- **Alerting** — `monitor/alerts.py`: webhook (Slack/Discord/Teams/ntfy), desktop toast, email (SMTP), and always-on `reports/alerts.log` on qualifying deltas (`examples/alerts.json`, `monitor alerts --test`).
+- **Web front door** — Dashboard, Findings, Assets, History, Certs, Reports (download HTML/JSON/CSV/MD/PDF), live-streamed scans.
+- **Plugin system** — `engine/plugins.py` + `plugins/`: user-droppable checks. *Analysis* plugins are pure and fold into hygiene (run in monitor too); *active* plugins probe hosts in one-time mode and honour the pentest authorization gate. `scan --plugins` / `--list-plugins`, web checkbox. Examples in `plugins/`.
+- **External intelligence** — `engine/extintel.py`: Shodan + Censys + VirusTotal lookup of *public* IPs only (never LAN), folded into findings. Opt-in (`scan --extintel`); keys in `examples/extintel.json`; stdlib-only.
+- **Rule engine** — `monitor/rules.py`: YAML/JSON alert policies (`examples/rules.yaml`) that suppress, re-rate, or route deltas to log/webhook/desktop/email. Falls back to the classic `min_severity` broadcast when absent.
+- **Scheduling & daemon** — `monitor/schedule.py`: `monitor schedule add` registers a Windows Task Scheduler / cron job; `monitor daemon --interval 6h` runs a foreground re-scan loop.
+- **PDF export** — `report.write_pdf` via WeasyPrint (falls back to a `wkhtmltopdf` binary); `--export pdf`.
+- **Test suite** — `tests/` (offline pytest) covering hygiene, reporting, plugins, rules, alerts, scheduling, and external-intel logic; `pyproject.toml` with optional-dependency extras.
 
 ### Still open (good next lifts)
 
-- **Plugin system** — turn hygiene/pentest checks into user-droppable plugins (see *Effectiveness › Plugin System*).
-- **External intel** — Shodan/Censys/VirusTotal exposure context (see *External Intelligence Integration*).
-- **Rule engine + scheduling** — YAML alert policies and cron/Task-Scheduler daemon mode (see *Rule Engine*, *Scheduled Collection*).
-- **PDF export, Docker image, pytest/CI** — packaging & polish.
+- **Docker image & CI** — official container with optional deps pre-installed; wire `pytest` + `bandit` + `mypy` into CI.
+- **Full async migration** — port `ports`/`enrichment`/`pentest` off `ThreadPoolExecutor` (discovery is already asyncio).
+- **First-class IPv6** and **expanded pentest** (AD/LDAP null sessions, web fuzzing).
 
 ---
 

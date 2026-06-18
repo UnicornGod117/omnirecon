@@ -11,7 +11,8 @@ Writers:
     write_reports   → (html, json)   — the default pair
     write_csv       → host inventory CSV
     write_markdown  → report_<stamp>.md
-    write_exports   → any subset of {html, json, csv, md}, returns {fmt: path}
+    write_pdf       → report_<stamp>.pdf   (WeasyPrint or wkhtmltopdf; optional)
+    write_exports   → any subset of {html, json, csv, md, pdf}, returns {fmt: path}
 """
 
 from __future__ import annotations
@@ -82,9 +83,56 @@ def write_markdown(report: Dict[str, Any], outdir: str, prefix: str = "report") 
     return path
 
 
+def pdf_available() -> bool:
+    """Whether a PDF backend (WeasyPrint or wkhtmltopdf) is usable."""
+    try:
+        import weasyprint  # type: ignore  # noqa: F401
+        return True
+    except Exception:
+        pass
+    import shutil
+    return shutil.which("wkhtmltopdf") is not None
+
+
+def write_pdf(report: Dict[str, Any], outdir: str, prefix: str = "report") -> str:
+    """Render the HTML report to PDF via WeasyPrint, falling back to a
+    wkhtmltopdf binary. Raises RuntimeError if neither is available."""
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, f"{prefix}_{now_stamp()}.pdf")
+    html_str = render_html(report)
+    try:
+        import weasyprint  # type: ignore
+        weasyprint.HTML(string=html_str).write_pdf(path)
+        return path
+    except ImportError:
+        pass
+    import shutil
+    import subprocess
+    import tempfile
+    if shutil.which("wkhtmltopdf"):
+        with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False,
+                                         encoding="utf-8") as tf:
+            tf.write(html_str)
+            tmp = tf.name
+        try:
+            r = subprocess.run(["wkhtmltopdf", "--quiet", tmp, path],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"wkhtmltopdf failed: {r.stderr.strip()}")
+        finally:
+            os.unlink(tmp)
+        return path
+    raise RuntimeError(
+        "PDF export needs WeasyPrint (`pip install weasyprint`) or the "
+        "wkhtmltopdf binary on PATH.")
+
+
 def write_exports(report: Dict[str, Any], outdir: str, formats: List[str],
                   prefix: str = "report") -> Dict[str, str]:
-    """Write any subset of {html,json,csv,md}. Returns {format: path}."""
+    """Write any subset of {html,json,csv,md,pdf}. Returns {format: path}.
+
+    A failed PDF export (no backend installed) is reported as an error string
+    under the "pdf" key rather than aborting the other formats."""
     out: Dict[str, str] = {}
     writers = {
         "json": lambda: write_json(report, outdir, prefix),
@@ -101,6 +149,11 @@ def write_exports(report: Dict[str, Any], outdir: str, formats: List[str],
     for fmt in formats:
         if fmt in writers:
             out[fmt] = writers[fmt]()
+    if "pdf" in formats:
+        try:
+            out["pdf"] = write_pdf(report, outdir, prefix)
+        except RuntimeError as e:
+            out["pdf"] = f"ERROR: {e}"
     return out
 
 

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnirecon"
+version = "7.0.0"
+description = "OmniRecon — one-time network scanning + over-time monitoring, browser-first."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+# The core runs on the standard library. Everything below is OPTIONAL — each
+# feature degrades gracefully when its dependency is absent (see ARCHITECTURE.md).
+[project.optional-dependencies]
+web = ["Flask>=2.0"]
+tui = ["textual>=0.40"]
+passive = ["scapy>=2.5"]
+snmp = ["puresnmp>=2.0"]
+zeroconf = ["zeroconf>=0.100"]
+desktop = ["plyer>=2.1"]
+pentest = ["paramiko>=3.0", "smbprotocol>=1.10"]
+rules = ["PyYAML>=6.0"]
+pdf = ["weasyprint>=60"]
+dev = ["pytest>=7.0", "PyYAML>=6.0"]
+
+[project.scripts]
+omnirecon = "omnirecon.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["omnirecon*", "web*", "lite*"]
+exclude = ["legacy*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

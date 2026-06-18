@@ -143,6 +143,33 @@ def _post_webhook(hook: Dict[str, Any], deltas: List[Dict[str, Any]],
         return str(e)
 
 
+def _send_email(cfg: Dict[str, Any], subject: str, body: str) -> Optional[str]:
+    """Send a plain-text email via SMTP. Returns an error string or None."""
+    import smtplib
+    from email.message import EmailMessage
+    host = cfg.get("smtp_host")
+    to = cfg.get("to")
+    if not host or not to:
+        return "email channel missing smtp_host/to"
+    recipients = to if isinstance(to, list) else [to]
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = cfg.get("from") or cfg.get("username") or "omnirecon@localhost"
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+    try:
+        port = int(cfg.get("smtp_port", 587))
+        with smtplib.SMTP(host, port, timeout=15) as s:
+            if cfg.get("use_tls", True):
+                s.starttls()
+            if cfg.get("username"):
+                s.login(cfg["username"], cfg.get("password", ""))
+            s.send_message(msg)
+        return None
+    except Exception as e:  # noqa: BLE001
+        return str(e)
+
+
 def _desktop_notify(title: str, message: str) -> Optional[str]:
     try:
         from plyer import notification  # type: ignore
@@ -167,41 +194,94 @@ def _desktop_notify(title: str, message: str) -> Optional[str]:
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
+def _route(processed: List, channel: str, min_sev: int) -> List[Dict[str, Any]]:
+    """Deltas that should go to `channel`. Rule-routed deltas (explicit channel
+    set) bypass the severity threshold; default-routed deltas (channels=None)
+    must clear min_severity and not be restricted away from this channel."""
+    out: List[Dict[str, Any]] = []
+    for delta, chans in processed:
+        if chans is None:
+            if _SEV_RANK.get(delta["severity"], 0) >= min_sev:
+                out.append(delta)
+        elif channel in chans:
+            out.append(delta)
+    return out
+
+
 def dispatch(deltas: List[Dict[str, Any]], stamp: str, outdir: str,
              config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Send qualifying deltas to all configured channels. Returns a summary."""
+    """Send qualifying deltas to configured channels, honouring any rule policy.
+
+    Flow: load config → apply rules (suppress / re-rate / route) → per-channel
+    threshold + dispatch. With no rules file, behaviour is the classic
+    min_severity broadcast to every configured channel.
+    """
     cfg = config if config is not None else load_config()
     if not cfg or not cfg.get("enabled", True):
         return {"dispatched": False, "reason": "no config / disabled"}
 
-    min_sev = _SEV_RANK.get(str(cfg.get("min_severity", "medium")).lower(), 2)
-    matched = [d for d in deltas if _SEV_RANK.get(d["severity"], 0) >= min_sev]
-    if not matched:
-        return {"dispatched": False, "matched": 0, "reason": "nothing above threshold"}
+    # Apply the rule engine (no-op when there is no rules file).
+    rules_applied = 0
+    try:
+        from . import rules as rules_mod
+        rule_list = rules_mod.load(cfg.get("rules_file"))
+        if rule_list:
+            processed = rules_mod.evaluate(deltas, rule_list)
+            rules_applied = len(rule_list)
+        else:
+            processed = [(d, None) for d in deltas]
+    except ValueError as e:
+        return {"dispatched": False, "reason": f"rules error: {e}"}
 
+    if not processed:
+        return {"dispatched": False, "matched": 0, "reason": "all suppressed by rules"}
+
+    min_sev = _SEV_RANK.get(str(cfg.get("min_severity", "medium")).lower(), 2)
     channels: List[str] = []
     errors: List[str] = []
 
+    # log
     if cfg.get("log", True):
-        try:
-            _write_log(matched, stamp, outdir)
-            channels.append("log")
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"log: {e}")
+        log_deltas = _route(processed, "log", min_sev)
+        if log_deltas:
+            try:
+                _write_log(log_deltas, stamp, outdir)
+                channels.append("log")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"log: {e}")
 
-    for hook in (cfg.get("webhooks") or ([cfg["webhook"]] if cfg.get("webhook") else [])):
-        err = _post_webhook(hook, matched, stamp)
-        if err:
-            errors.append(f"webhook: {err}")
-        else:
-            channels.append("webhook")
+    # webhook
+    webhook_deltas = _route(processed, "webhook", min_sev)
+    if webhook_deltas:
+        for hook in (cfg.get("webhooks") or ([cfg["webhook"]] if cfg.get("webhook") else [])):
+            err = _post_webhook(hook, webhook_deltas, stamp)
+            if err:
+                errors.append(f"webhook: {err}")
+            elif "webhook" not in channels:
+                channels.append("webhook")
 
+    # desktop
     if cfg.get("desktop"):
-        err = _desktop_notify("OmniRecon", summarize(matched))
-        if err:
-            errors.append(f"desktop: {err}")
-        else:
-            channels.append("desktop")
+        desk_deltas = _route(processed, "desktop", min_sev)
+        if desk_deltas:
+            err = _desktop_notify("OmniRecon", summarize(desk_deltas))
+            if err:
+                errors.append(f"desktop: {err}")
+            else:
+                channels.append("desktop")
 
-    return {"dispatched": bool(channels), "matched": len(matched),
-            "channels": channels, "errors": errors}
+    # email
+    if cfg.get("email"):
+        email_deltas = _route(processed, "email", min_sev)
+        if email_deltas:
+            err = _send_email(cfg["email"], f"OmniRecon: {len(email_deltas)} change(s)",
+                              summarize(email_deltas))
+            if err:
+                errors.append(f"email: {err}")
+            else:
+                channels.append("email")
+
+    matched = len({id(d) for d, _ in processed
+                   if _ is not None or _SEV_RANK.get(d["severity"], 0) >= min_sev})
+    return {"dispatched": bool(channels), "matched": matched,
+            "channels": channels, "errors": errors, "rules_applied": rules_applied}

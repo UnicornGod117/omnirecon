@@ -21,6 +21,15 @@ network_report_*.html
 cve_cache.json
 omnirecon_audit.jsonl
 
+# Local config (may hold API keys, webhook URLs, alert policies)
+.omnirecon/
+
+# Test / build artifacts
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
 # OS files
 .DS_Store
 Thumbs.db

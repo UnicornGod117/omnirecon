@@ -58,6 +58,8 @@ def _opts_from_config(config: dict) -> EngineOptions:
         cve_min_score=float(config.get("cve_min_score") or 6.0),
         topology=bool(config.get("topology")),
         tags_file=config.get("tags_file") or None,
+        extintel=bool(config.get("extintel")),
+        plugins=bool(config.get("plugins")),
     )
 
 
