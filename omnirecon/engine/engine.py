@@ -118,6 +118,7 @@ def run_engine(opts: EngineOptions, stage_cb: StageCb = None,
     report["privileges"] = check_privileges()
     report["interfaces"] = netinfo.get_interfaces()
     report["routes"] = netinfo.get_routes_and_gateway()
+    report["wifi"] = netinfo.get_wifi_info()
     report["dns_servers"] = netinfo.get_dns_servers()
     report["neighbors"] = netinfo.get_neighbor_table(include_ipv6=opts.ipv6)
     report["listening_ports"] = netinfo.get_listening_ports()
@@ -212,7 +213,9 @@ def run_engine(opts: EngineOptions, stage_cb: StageCb = None,
 
     if opts.topology and hosts:
         stage("Building topology")
-        report["topology"] = topology.build(hosts, report.get("routes", {}))
+        report["topology"] = topology.build(
+            hosts, report.get("routes", {}),
+            wifi=report.get("wifi"), neighbors=report.get("neighbors"))
 
     stage("Public IP")
     report["public_ip"] = netinfo.get_public_ip()

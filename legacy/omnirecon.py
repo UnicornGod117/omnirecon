@@ -2926,6 +2926,232 @@ def get_routes_and_gateway() -> Dict[str, Any]:
     return out
 
 
+# ── Wi-Fi / wireless uplink ─────────────────────────────────────────────────────
+#
+# Describes the wireless link between this machine and the router/AP it is
+# associated with: SSID, the AP's BSSID (radio MAC), RSSI / signal quality,
+# channel + band, negotiated PHY rates, and BSS-level beacon details. Used to
+# enrich the topology gateway node so you can see *which* AP you ride and how
+# strong the link is. Returns {"connected": False, ...} on wired-only hosts.
+
+_WIFI_SIGNAL_LABELS = (
+    (-50, "excellent"), (-60, "good"), (-67, "fair"), (-75, "weak"),
+)
+
+
+def _band_from_freq(mhz: Optional[int]) -> Optional[str]:
+    if not mhz:
+        return None
+    if 2400 <= mhz < 2500:
+        return "2.4 GHz"
+    if 4900 <= mhz < 5900:
+        return "5 GHz"
+    if 5925 <= mhz <= 7125:
+        return "6 GHz"
+    return None
+
+
+def _dbm_to_pct(dbm: Optional[int]) -> Optional[int]:
+    """Rough RSSI→quality mapping (-100 dBm ≈ 0 %, -50 dBm ≈ 100 %)."""
+    if dbm is None:
+        return None
+    return max(0, min(100, int(2 * (dbm + 100))))
+
+
+def _pct_to_dbm(pct: Optional[int]) -> Optional[int]:
+    if pct is None:
+        return None
+    return int(pct / 2 - 100)
+
+
+def _signal_label(dbm: Optional[int]) -> Optional[str]:
+    if dbm is None:
+        return None
+    for threshold, label in _WIFI_SIGNAL_LABELS:
+        if dbm >= threshold:
+            return label
+    return "very weak"
+
+
+def _wifi_finalize(info: Dict[str, Any]) -> Dict[str, Any]:
+    if info.get("signal_dbm") is None and info.get("signal_pct") is not None:
+        info["signal_dbm"] = _pct_to_dbm(info["signal_pct"])
+    if info.get("signal_pct") is None and info.get("signal_dbm") is not None:
+        info["signal_pct"] = _dbm_to_pct(info["signal_dbm"])
+    if info.get("band") is None:
+        info["band"] = _band_from_freq(info.get("frequency_mhz"))
+    if (info.get("snr_db") is None and info.get("signal_dbm") is not None
+            and info.get("noise_dbm") is not None):
+        info["snr_db"] = info["signal_dbm"] - info["noise_dbm"]
+    info["signal_quality"] = _signal_label(info.get("signal_dbm"))
+    return info
+
+
+def _wifi_linux() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"connected": False}
+    raw: Dict[str, Any] = {}
+    iface: Optional[str] = None
+    if which("iw"):
+        dev = safe_run(["iw", "dev"], timeout=6)
+        raw["iw_dev"] = dev.get("stdout")
+        for line in (dev.get("stdout") or "").splitlines():
+            m = re.search(r"^\s*Interface\s+(\S+)", line)
+            if m:
+                iface = m.group(1)
+                break
+    if iface and which("iw"):
+        info["interface"] = iface
+        link = safe_run(["iw", "dev", iface, "link"], timeout=6)
+        out = link.get("stdout") or ""
+        raw["iw_link"] = out
+        if out.strip() and "Not connected" not in out:
+            info["connected"] = True
+            patterns = {
+                "bssid": (r"Connected to ([0-9a-f:]{17})", str),
+                "ssid": (r"\bSSID:\s*(.+)", str),
+                "frequency_mhz": (r"\bfreq:\s*(\d+)", int),
+                "signal_dbm": (r"\bsignal:\s*(-?\d+)\s*dBm", int),
+                "tx_rate_mbps": (r"tx bitrate:\s*([\d.]+)\s*MBit/s", float),
+                "rx_rate_mbps": (r"rx bitrate:\s*([\d.]+)\s*MBit/s", float),
+                "beacon_interval": (r"beacon int:\s*(\d+)", int),
+                "dtim_period": (r"dtim period:\s*(\d+)", int),
+            }
+            for key, (pat, cast) in patterns.items():
+                m = re.search(pat, out, re.I)
+                if m:
+                    val = m.group(1).strip()
+                    info[key] = cast(val) if cast is not str else val
+            if info.get("bssid"):
+                info["bssid"] = info["bssid"].lower()
+            m = re.search(r"bss flags:\s*(.+)", out, re.I)
+            if m:
+                info["bss_flags"] = m.group(1).strip()
+        st = safe_run(["iw", "dev", iface, "info"], timeout=6)
+        raw["iw_info"] = st.get("stdout")
+        m = re.search(r"channel\s+(\d+).*?width:\s*(\d+)\s*MHz",
+                      st.get("stdout") or "", re.I | re.S)
+        if m:
+            info["channel"] = int(m.group(1))
+            info["channel_width_mhz"] = int(m.group(2))
+        m = re.search(r"txpower\s+([\d.]+)\s*dBm", st.get("stdout") or "", re.I)
+        if m:
+            info["tx_power_dbm"] = float(m.group(1))
+    if which("nmcli"):
+        nm = safe_run(["nmcli", "-t", "-f",
+                       "IN-USE,SSID,BSSID,CHAN,FREQ,SIGNAL,RATE,SECURITY",
+                       "device", "wifi"], timeout=8)
+        raw["nmcli"] = nm.get("stdout")
+        for line in (nm.get("stdout") or "").splitlines():
+            if not line.startswith("*"):
+                continue
+            parts = re.split(r"(?<!\\):", line)
+            parts = [p.replace("\\:", ":") for p in parts]
+            if len(parts) >= 8:
+                info["connected"] = True
+                info.setdefault("ssid", parts[1] or None)
+                info.setdefault("bssid", (parts[2] or "").lower() or None)
+                if parts[3].isdigit():
+                    info.setdefault("channel", int(parts[3]))
+                fm = re.search(r"(\d+)", parts[4])
+                if fm:
+                    info.setdefault("frequency_mhz", int(fm.group(1)))
+                if parts[5].isdigit():
+                    info.setdefault("signal_pct", int(parts[5]))
+                info.setdefault("tx_rate", parts[6] or None)
+                info["security"] = parts[7] or "Open"
+            break
+    info["raw"] = raw
+    return info
+
+
+def _wifi_macos() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"connected": False}
+    raw: Dict[str, Any] = {}
+    airport = ("/System/Library/PrivateFrameworks/Apple80211.framework/"
+               "Versions/Current/Resources/airport")
+    a = safe_run([airport, "-I"], timeout=8)
+    out = a.get("stdout") or ""
+    raw["airport_I"] = out
+    fields = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            fields[k.strip().lower()] = v.strip()
+    if fields.get("ssid") or fields.get("bssid"):
+        info["connected"] = True
+        info["ssid"] = fields.get("ssid")
+        info["bssid"] = (fields.get("bssid") or "").lower() or None
+        for src, dst, cast in (("agrctlrssi", "signal_dbm", int),
+                               ("agrctlnoise", "noise_dbm", int),
+                               ("lasttxrate", "tx_rate_mbps", float),
+                               ("maxrate", "max_rate_mbps", float)):
+            try:
+                if fields.get(src) not in (None, ""):
+                    info[dst] = cast(fields[src])
+            except ValueError:
+                pass
+        ch = fields.get("channel", "")
+        cm = re.match(r"(\d+)(?:,(\d+))?", ch)
+        if cm:
+            info["channel"] = int(cm.group(1))
+            if cm.group(2):
+                info["channel_width_mhz"] = int(cm.group(2))
+        info["phy_mode"] = fields.get("phymode") or fields.get("802.11 auth")
+        info["security"] = fields.get("link auth")
+    info["raw"] = raw
+    return info
+
+
+def _wifi_windows() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"connected": False}
+    raw: Dict[str, Any] = {}
+    w = safe_run(["netsh", "wlan", "show", "interfaces"], timeout=10)
+    out = w.get("stdout") or ""
+    raw["netsh"] = out
+    fields = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            fields[k.strip().lower()] = v.strip()
+    if fields.get("state", "").lower() == "connected" or fields.get("bssid"):
+        info["connected"] = True
+        info["interface"] = fields.get("name")
+        info["ssid"] = fields.get("ssid")
+        info["bssid"] = (fields.get("bssid") or "").lower() or None
+        info["phy_mode"] = fields.get("radio type")
+        info["security"] = fields.get("authentication")
+        info["band"] = fields.get("band") or None
+        for src, dst, cast in (("channel", "channel", int),
+                               ("receive rate (mbps)", "rx_rate_mbps", float),
+                               ("transmit rate (mbps)", "tx_rate_mbps", float)):
+            try:
+                if fields.get(src):
+                    info[dst] = cast(fields[src])
+            except ValueError:
+                pass
+        sm = re.search(r"(\d+)", fields.get("signal", ""))
+        if sm:
+            info["signal_pct"] = int(sm.group(1))
+    info["raw"] = raw
+    return info
+
+
+def get_wifi_info() -> Dict[str, Any]:
+    """Describe the wireless uplink to the connected router/AP (if any)."""
+    try:
+        if is_windows():
+            info = _wifi_windows()
+        elif is_macos():
+            info = _wifi_macos()
+        elif is_linux():
+            info = _wifi_linux()
+        else:
+            info = {"connected": False, "error": "unsupported platform"}
+    except Exception as e:
+        return {"connected": False, "error": repr(e)}
+    return _wifi_finalize(info)
+
+
 def get_dns_config() -> Dict[str, Any]:
     out: Dict[str, Any] = {"dns_servers": [], "raw": None}
     try:
@@ -3813,6 +4039,9 @@ h2{font-size:1.05rem;font-weight:700;margin-bottom:12px}
 .info-table td{padding:6px 10px;border-bottom:1px solid #f1f5f9}
 .info-table td:first-child{font-weight:600;color:var(--muted);
   font-size:0.8rem;width:200px;white-space:nowrap}
+.info-card{flex:1;min-width:300px;background:var(--card,#fff);
+  border:1px solid var(--border);border-radius:10px;padding:12px 16px}
+.info-card h3{margin:0 0 8px;font-size:.92rem}
 
 /* Connectivity */
 .conn-ok  {color:var(--green);font-weight:700}
@@ -3963,17 +4192,45 @@ def _history_bar(ip: str, history: Dict[str, Any]) -> str:
 
 def _build_topology_js(hosts: List[Dict[str, Any]],
                        gateway_ip: Optional[str],
-                       self_ips: Set[str]) -> str:
-    """Build vis.js nodes + edges JSON for the topology tab."""
+                       self_ips: Set[str],
+                       wifi: Optional[Dict[str, Any]] = None,
+                       gw_info: Optional[Dict[str, Any]] = None) -> str:
+    """Build vis.js nodes + edges JSON for the topology tab.
+
+    The gateway node tooltip carries the router's MAC/vendor and — on Wi-Fi —
+    the SSID/BSSID/signal so you can see which AP/router you ride. The
+    self→gateway edge is labelled with the live signal reading.
+    """
     nodes = []
     edges = []
     added_ips: Set[str] = set()
+    wifi = wifi or {}
+    gw_info = gw_info or {}
 
-    # Gateway node
+    # Gateway node — enriched with router/AP detail.
     if gateway_ip:
+        gw_tip_parts = [f"Gateway {gateway_ip}"]
+        if gw_info.get("mac"):
+            gw_tip_parts.append(f"MAC {gw_info['mac']}")
+        if gw_info.get("vendor"):
+            gw_tip_parts.append(gw_info["vendor"])
+        gw_label = f"Gateway\\n{gateway_ip}"
+        if wifi.get("connected"):
+            ssid = wifi.get("ssid") or "Wi-Fi"
+            gw_label = f"📶 {ssid}\\n{gateway_ip}"
+            if wifi.get("bssid"):
+                gw_tip_parts.append(f"BSSID {wifi['bssid']}")
+            if wifi.get("signal_dbm") is not None:
+                gw_tip_parts.append(
+                    f"Signal {wifi['signal_dbm']} dBm"
+                    f"{' (' + wifi['signal_quality'] + ')' if wifi.get('signal_quality') else ''}")
+            if wifi.get("band") or wifi.get("channel"):
+                gw_tip_parts.append(
+                    f"{wifi.get('band') or ''} ch {wifi.get('channel') or '?'}".strip())
         nodes.append({
             "id": "gw",
-            "label": f"Gateway\n{gateway_ip}",
+            "label": gw_label,
+            "title": "\\n".join(gw_tip_parts),
             "shape": "star",
             "color": {"background": "#fbbf24", "border": "#d97706"},
             "font": {"size": 12, "color": "#1e293b"},
@@ -4028,12 +4285,23 @@ def _build_topology_js(hosts: List[Dict[str, Any]],
         })
         added_ips.add(ip)
 
-        # Edge to gateway
+        # Edge to gateway. Highlight our own uplink with the live signal.
         edge_to = "gw" if gateway_ip else None
         if edge_to:
-            edges.append({"from": ip, "to": edge_to,
-                          "color": {"color": "#dde3ec"},
-                          "width": 1.5})
+            edge = {"from": ip, "to": edge_to,
+                    "color": {"color": "#dde3ec"}, "width": 1.5}
+            if is_self and wifi.get("connected"):
+                pct = wifi.get("signal_pct")
+                col = ("#22c55e" if (pct or 0) >= 66 else
+                       "#f59e0b" if (pct or 0) >= 33 else "#ef4444")
+                lbl = "Wi-Fi"
+                if wifi.get("signal_dbm") is not None:
+                    lbl = f"📶 {wifi['signal_dbm']}dBm"
+                edge.update({"color": {"color": col}, "width": 3,
+                             "label": lbl, "dashes": False,
+                             "font": {"size": 10, "color": col,
+                                      "background": "#0f172a"}})
+            edges.append(edge)
 
     return json.dumps({"nodes": nodes, "edges": edges}, ensure_ascii=False)
 
@@ -4482,7 +4750,114 @@ def render_html(report: Dict[str, Any],
     )
 
     # ── Topology ─────────────────────────────────────────────────────────────
-    topo_data = _build_topology_js(hosts, gw, self_ips)
+    wifi = report.get("wifi", {}) or {}
+    neighbors = report.get("neighbors", {}) or {}
+    ip_mac_map, ip_state_map = build_neighbor_maps(neighbors)
+
+    # Consolidated router/gateway picture for the topology.
+    gw_host = next((h for h in hosts if h.get("ip") == gw), None)
+    gw_info = {
+        "ip": gw,
+        "mac": (gw_host or {}).get("mac") or ip_mac_map.get(gw),
+        "vendor": (gw_host or {}).get("vendor"),
+        "device_name": (gw_host or {}).get("device_name"),
+        "arp_state": ip_state_map.get(gw),
+        "uplink": "wireless" if wifi.get("connected") else "wired/unknown",
+    }
+
+    topo_data = _build_topology_js(hosts, gw, self_ips, wifi=wifi, gw_info=gw_info)
+
+    # Router / wireless uplink panel ------------------------------------------
+    def _uplink_rows(pairs):
+        return "".join(
+            f'<tr><td style="color:var(--muted)">{html_escape(k)}</td>'
+            f'<td>{html_escape(v)}</td></tr>'
+            for k, v in pairs if v not in (None, "", "—"))
+
+    router_rows = [
+        ("Gateway IP",       gw or "—"),
+        ("MAC (ARP)",        gw_info["mac"]),
+        ("Vendor",           gw_info["vendor"]),
+        ("Name",             gw_info["device_name"]),
+        ("ARP state",        gw_info["arp_state"]),
+        ("Uplink",           gw_info["uplink"]),
+    ]
+    if wifi.get("connected"):
+        sig = wifi.get("signal_dbm")
+        sig_txt = "—"
+        if sig is not None or wifi.get("signal_pct") is not None:
+            bits = []
+            if sig is not None: bits.append(f"{sig} dBm")
+            if wifi.get("signal_pct") is not None: bits.append(f"{wifi['signal_pct']}%")
+            if wifi.get("signal_quality"): bits.append(f"({wifi['signal_quality']})")
+            sig_txt = " ".join(bits)
+        chan = wifi.get("channel")
+        if chan and wifi.get("channel_width_mhz"):
+            chan = f"{chan} ({wifi['channel_width_mhz']} MHz wide)"
+        rate = None
+        if wifi.get("tx_rate_mbps") or wifi.get("rx_rate_mbps"):
+            rate = f"↑ {wifi.get('tx_rate_mbps') or '—'} / ↓ {wifi.get('rx_rate_mbps') or '—'} Mbps"
+        wifi_rows = [
+            ("SSID",            wifi.get("ssid")),
+            ("BSSID (AP radio)", wifi.get("bssid")),
+            ("Signal",          sig_txt),
+            ("Band",            wifi.get("band")),
+            ("Channel",         chan),
+            ("Frequency",       f"{wifi['frequency_mhz']} MHz" if wifi.get("frequency_mhz") else None),
+            ("PHY / mode",      wifi.get("phy_mode")),
+            ("Security",        wifi.get("security")),
+            ("Link rate",       rate),
+            ("Tx power",        f"{wifi['tx_power_dbm']} dBm" if wifi.get("tx_power_dbm") else None),
+            ("SNR",             f"{wifi['snr_db']} dB" if wifi.get("snr_db") is not None else None),
+            ("Noise",           f"{wifi['noise_dbm']} dBm" if wifi.get("noise_dbm") is not None else None),
+            ("Beacon interval", wifi.get("beacon_interval")),
+            ("DTIM period",     wifi.get("dtim_period")),
+            ("BSS flags",       wifi.get("bss_flags")),
+            ("Interface",       wifi.get("interface")),
+        ]
+        wifi_panel = (
+            '<div class="info-card"><h3>📶 Wireless uplink → '
+            f'{html_escape(wifi.get("ssid") or "router")}</h3>'
+            f'<table class="info-table">{_uplink_rows(wifi_rows)}</table></div>')
+    else:
+        note = "Wired or no wireless link detected."
+        if wifi.get("error"):
+            note += f" ({html_escape(wifi['error'])})"
+        wifi_panel = (f'<div class="info-card"><h3>📶 Wireless uplink</h3>'
+                      f'<p style="color:var(--muted)">{note}</p></div>')
+
+    router_panel = (
+        '<div class="info-card"><h3>🌐 Router / gateway</h3>'
+        f'<table class="info-table">{_uplink_rows(router_rows)}</table></div>')
+
+    uplink_html = (
+        '<div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:16px">'
+        f'{router_panel}{wifi_panel}</div>')
+
+    # ARP / NDP neighbour table ------------------------------------------------
+    nb_list = neighbors.get("neighbors", []) or []
+    if nb_list:
+        nb_rows = []
+        for n in sorted(nb_list, key=lambda x: (x.get("version", 4), str(x.get("ip")))):
+            tag = (' <span style="background:#0d9488;color:#fff;font-size:.66rem;'
+                   'padding:1px 6px;border-radius:8px">gateway</span>'
+                   if n.get("ip") == gw else "")
+            nb_rows.append(
+                f'<tr><td>{html_escape(n.get("ip"))}{tag}</td>'
+                f'<td>{html_escape(n.get("mac") or "—")}</td>'
+                f'<td>IPv{html_escape(n.get("version") or 4)}</td>'
+                f'<td>{html_escape(n.get("interface") or "—")}</td>'
+                f'<td>{html_escape(n.get("state") or "—")}</td></tr>')
+        arp_html = (
+            f'<h3 style="margin-top:18px">🧭 ARP / NDP Neighbours ({len(nb_list)})</h3>'
+            '<div class="tbl-wrap"><table class="host-table"><thead><tr>'
+            '<th>IP Address</th><th>MAC</th><th>Family</th>'
+            '<th>Interface</th><th>State</th></tr></thead>'
+            f'<tbody>{"".join(nb_rows)}</tbody></table></div>')
+    else:
+        arp_html = ('<h3 style="margin-top:18px">🧭 ARP / NDP Neighbours</h3>'
+                    '<p class="empty">No ARP/NDP neighbours recorded.</p>')
+
     topo_legend_items = []
     seen_types: Set[str] = set()
     color_map_js = {
@@ -4504,11 +4879,13 @@ def render_html(report: Dict[str, Any],
                 f'margin-right:4px"></span>{icon} {html_escape(dt_)}</span>')
 
     topo_html = (
+        f'{uplink_html}'
         f'<div id="topology-container"></div>'
         f'<p style="font-size:.78rem;color:var(--muted);margin-top:8px">'
-        f'Drag nodes to rearrange. Scroll to zoom. '
-        f'Requires internet connection to load vis.js from CDN.</p>'
+        f'Drag nodes to rearrange. Scroll to zoom. Hover the gateway for '
+        f'router/AP detail. Requires internet connection to load vis.js from CDN.</p>'
         f'<div style="margin-top:8px">{"".join(topo_legend_items)}</div>'
+        f'{arp_html}'
         f'<script>'
         f'(function initTopologyWhenReady() {{'
         f'  if (typeof vis === "undefined") {{ setTimeout(initTopologyWhenReady, 50); return; }}'
@@ -4969,6 +5346,7 @@ def main() -> None:
     print("  [2/8] Routes & DNS …")
     report["routes"] = get_routes_and_gateway()
     report["dns"]    = get_dns_config()
+    report["wifi"]   = get_wifi_info()
     default_iface    = report["routes"].get("default_iface")
     gw               = report["routes"].get("default_gateway")
 

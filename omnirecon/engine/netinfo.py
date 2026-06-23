@@ -111,6 +111,240 @@ def get_routes_and_gateway() -> Dict[str, Any]:
     return out
 
 
+# ── Wi-Fi / wireless uplink ─────────────────────────────────────────────────────
+#
+# Describes the wireless link between this machine and the router/AP it is
+# associated with: SSID, the AP's BSSID (radio MAC), RSSI / signal quality,
+# channel + band, negotiated PHY rates, and BSS-level beacon details. This is
+# what lets the topology pinpoint *which* AP/router we are riding and how strong
+# the link is. Returns {"connected": False, ...} on wired-only hosts.
+
+_WIFI_SIGNAL_LABELS = (
+    (-50, "excellent"), (-60, "good"), (-67, "fair"), (-75, "weak"),
+)
+
+
+def _band_from_freq(mhz: Optional[int]) -> Optional[str]:
+    if not mhz:
+        return None
+    if 2400 <= mhz < 2500:
+        return "2.4 GHz"
+    if 4900 <= mhz < 5900:
+        return "5 GHz"
+    if 5925 <= mhz <= 7125:
+        return "6 GHz"
+    return None
+
+
+def _dbm_to_pct(dbm: Optional[int]) -> Optional[int]:
+    """Rough RSSI→quality mapping (-100 dBm ≈ 0 %, -50 dBm ≈ 100 %)."""
+    if dbm is None:
+        return None
+    return max(0, min(100, int(2 * (dbm + 100))))
+
+
+def _pct_to_dbm(pct: Optional[int]) -> Optional[int]:
+    if pct is None:
+        return None
+    return int(pct / 2 - 100)
+
+
+def _signal_label(dbm: Optional[int]) -> Optional[str]:
+    if dbm is None:
+        return None
+    for threshold, label in _WIFI_SIGNAL_LABELS:
+        if dbm >= threshold:
+            return label
+    return "very weak"
+
+
+def _wifi_finalize(info: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill derived fields (band, signal %/dBm, SNR, quality label)."""
+    if info.get("signal_dbm") is None and info.get("signal_pct") is not None:
+        info["signal_dbm"] = _pct_to_dbm(info["signal_pct"])
+    if info.get("signal_pct") is None and info.get("signal_dbm") is not None:
+        info["signal_pct"] = _dbm_to_pct(info["signal_dbm"])
+    if info.get("band") is None:
+        info["band"] = _band_from_freq(info.get("frequency_mhz"))
+    if (info.get("snr_db") is None and info.get("signal_dbm") is not None
+            and info.get("noise_dbm") is not None):
+        info["snr_db"] = info["signal_dbm"] - info["noise_dbm"]
+    info["signal_quality"] = _signal_label(info.get("signal_dbm"))
+    return info
+
+
+def _wifi_linux() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"connected": False}
+    raw: Dict[str, Any] = {}
+
+    iface: Optional[str] = None
+    if which("iw"):
+        dev = safe_run(["iw", "dev"], timeout=6)
+        raw["iw_dev"] = dev.get("stdout")
+        for line in (dev.get("stdout") or "").splitlines():
+            m = re.search(r"^\s*Interface\s+(\S+)", line)
+            if m:
+                iface = m.group(1)
+                break
+
+    if iface and which("iw"):
+        info["interface"] = iface
+        link = safe_run(["iw", "dev", iface, "link"], timeout=6)
+        out = link.get("stdout") or ""
+        raw["iw_link"] = out
+        if out.strip() and "Not connected" not in out:
+            info["connected"] = True
+            patterns = {
+                "bssid": (r"Connected to ([0-9a-f:]{17})", str),
+                "ssid": (r"\bSSID:\s*(.+)", str),
+                "frequency_mhz": (r"\bfreq:\s*(\d+)", int),
+                "signal_dbm": (r"\bsignal:\s*(-?\d+)\s*dBm", int),
+                "tx_rate_mbps": (r"tx bitrate:\s*([\d.]+)\s*MBit/s", float),
+                "rx_rate_mbps": (r"rx bitrate:\s*([\d.]+)\s*MBit/s", float),
+                "beacon_interval": (r"beacon int:\s*(\d+)", int),
+                "dtim_period": (r"dtim period:\s*(\d+)", int),
+            }
+            for key, (pat, cast) in patterns.items():
+                m = re.search(pat, out, re.I)
+                if m:
+                    val = m.group(1).strip()
+                    info[key] = cast(val) if cast is not str else val
+            if info.get("bssid"):
+                info["bssid"] = info["bssid"].lower()
+            m = re.search(r"bss flags:\s*(.+)", out, re.I)
+            if m:
+                info["bss_flags"] = m.group(1).strip()
+        # Channel width / center freq / tx power live in `iw dev <iface> info`.
+        st = safe_run(["iw", "dev", iface, "info"], timeout=6)
+        raw["iw_info"] = st.get("stdout")
+        m = re.search(r"channel\s+(\d+).*?width:\s*(\d+)\s*MHz",
+                      st.get("stdout") or "", re.I | re.S)
+        if m:
+            info["channel"] = int(m.group(1))
+            info["channel_width_mhz"] = int(m.group(2))
+        m = re.search(r"txpower\s+([\d.]+)\s*dBm", st.get("stdout") or "", re.I)
+        if m:
+            info["tx_power_dbm"] = float(m.group(1))
+
+    # nmcli supplements security + a signal % even when iw is missing.
+    if which("nmcli"):
+        nm = safe_run(["nmcli", "-t", "-f",
+                       "IN-USE,SSID,BSSID,CHAN,FREQ,SIGNAL,RATE,SECURITY",
+                       "device", "wifi"], timeout=8)
+        raw["nmcli"] = nm.get("stdout")
+        for line in (nm.get("stdout") or "").splitlines():
+            if not line.startswith("*"):
+                continue
+            # nmcli escapes the ':' inside BSSID as '\:' — undo that.
+            parts = re.split(r"(?<!\\):", line)
+            parts = [p.replace("\\:", ":") for p in parts]
+            if len(parts) >= 8:
+                info["connected"] = True
+                info.setdefault("ssid", parts[1] or None)
+                info.setdefault("bssid", (parts[2] or "").lower() or None)
+                if parts[3].isdigit():
+                    info.setdefault("channel", int(parts[3]))
+                fm = re.search(r"(\d+)", parts[4])
+                if fm:
+                    info.setdefault("frequency_mhz", int(fm.group(1)))
+                if parts[5].isdigit():
+                    info.setdefault("signal_pct", int(parts[5]))
+                info.setdefault("tx_rate", parts[6] or None)
+                info["security"] = parts[7] or "Open"
+            break
+
+    info["raw"] = raw
+    return info
+
+
+def _wifi_macos() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"connected": False}
+    raw: Dict[str, Any] = {}
+    airport = ("/System/Library/PrivateFrameworks/Apple80211.framework/"
+               "Versions/Current/Resources/airport")
+    a = safe_run([airport, "-I"], timeout=8)
+    out = a.get("stdout") or ""
+    raw["airport_I"] = out
+    fields = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            fields[k.strip().lower()] = v.strip()
+    if fields.get("ssid") or fields.get("bssid"):
+        info["connected"] = True
+        info["ssid"] = fields.get("ssid")
+        info["bssid"] = (fields.get("bssid") or "").lower() or None
+        for src, dst, cast in (("agrctlrssi", "signal_dbm", int),
+                               ("agrctlnoise", "noise_dbm", int),
+                               ("lasttxrate", "tx_rate_mbps", float),
+                               ("maxrate", "max_rate_mbps", float)):
+            try:
+                if fields.get(src) not in (None, ""):
+                    info[dst] = cast(fields[src])
+            except ValueError:
+                pass
+        ch = fields.get("channel", "")
+        cm = re.match(r"(\d+)(?:,(\d+))?", ch)
+        if cm:
+            info["channel"] = int(cm.group(1))
+            if cm.group(2):
+                info["channel_width_mhz"] = int(cm.group(2))
+        info["phy_mode"] = fields.get("phymode") or fields.get("802.11 auth")
+        info["security"] = fields.get("link auth")
+    info["raw"] = raw
+    return info
+
+
+def _wifi_windows() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"connected": False}
+    raw: Dict[str, Any] = {}
+    w = safe_run(["netsh", "wlan", "show", "interfaces"], timeout=10)
+    out = w.get("stdout") or ""
+    raw["netsh"] = out
+    fields = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            fields[k.strip().lower()] = v.strip()
+    if fields.get("state", "").lower() == "connected" or fields.get("bssid"):
+        info["connected"] = True
+        info["interface"] = fields.get("name")
+        info["ssid"] = fields.get("ssid")
+        info["bssid"] = (fields.get("bssid") or "").lower() or None
+        info["phy_mode"] = fields.get("radio type")
+        info["security"] = fields.get("authentication")
+        info["band"] = fields.get("band") or None
+        for src, dst, cast in (("channel", "channel", int),
+                               ("receive rate (mbps)", "rx_rate_mbps", float),
+                               ("transmit rate (mbps)", "tx_rate_mbps", float)):
+            try:
+                if fields.get(src):
+                    info[dst] = cast(fields[src])
+            except ValueError:
+                pass
+        sm = re.search(r"(\d+)", fields.get("signal", ""))
+        if sm:
+            info["signal_pct"] = int(sm.group(1))
+    info["raw"] = raw
+    return info
+
+
+def get_wifi_info() -> Dict[str, Any]:
+    """Describe the wireless uplink to the connected router/AP (if any)."""
+    try:
+        if is_windows():
+            info = _wifi_windows()
+        elif is_macos():
+            info = _wifi_macos()
+        elif is_linux():
+            info = _wifi_linux()
+        else:
+            info = {"connected": False, "error": "unsupported platform"}
+    except Exception as e:  # never let link probing abort a scan
+        return {"connected": False, "error": repr(e)}
+    return _wifi_finalize(info)
+
+
 def get_dns_servers() -> List[str]:
     def _valid(addr: str) -> bool:
         try:
