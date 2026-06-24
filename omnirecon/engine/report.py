@@ -83,6 +83,19 @@ def write_markdown(report: Dict[str, Any], outdir: str, prefix: str = "report") 
     return path
 
 
+def write_graph(report: Dict[str, Any], outdir: str, fmt: str,
+                prefix: str = "report") -> str:
+    """Write the topology graph as mermaid / dot / graphml for external tools."""
+    from . import topology as _topo
+    os.makedirs(outdir, exist_ok=True)
+    ext = {"mermaid": "mmd", "dot": "dot", "graphml": "graphml"}[fmt]
+    path = os.path.join(outdir, f"{prefix}_{now_stamp()}.{ext}")
+    topo = report.get("topology") or {}
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_topo.export(topo, fmt) if topo.get("nodes") else "")
+    return path
+
+
 def pdf_available() -> bool:
     """Whether a PDF backend (WeasyPrint or wkhtmltopdf) is usable."""
     try:
@@ -138,6 +151,9 @@ def write_exports(report: Dict[str, Any], outdir: str, formats: List[str],
         "json": lambda: write_json(report, outdir, prefix),
         "csv": lambda: write_csv(report, outdir, prefix),
         "md": lambda: write_markdown(report, outdir, prefix),
+        "mermaid": lambda: write_graph(report, outdir, "mermaid", prefix),
+        "dot": lambda: write_graph(report, outdir, "dot", prefix),
+        "graphml": lambda: write_graph(report, outdir, "graphml", prefix),
     }
     if "html" in formats:
         stamp = now_stamp()
@@ -296,6 +312,348 @@ def _host_rows(hosts: List[Dict[str, Any]], by_host: Dict[str, Any]) -> str:
     return rows
 
 
+def _signal_bar(pct: Any) -> str:
+    try:
+        p = max(0, min(100, int(pct)))
+    except (TypeError, ValueError):
+        return ""
+    color = "#22c55e" if p >= 66 else "#f59e0b" if p >= 33 else "#ef4444"
+    return (f'<span class="sig-track"><span class="sig-fill" '
+            f'style="width:{p}%;background:{color}"></span></span>')
+
+
+def _wifi_panel(wifi: Dict[str, Any], gw_info: Dict[str, Any]) -> str:
+    """Render the wireless/router uplink as a labelled detail grid."""
+    if not wifi or not wifi.get("connected"):
+        note = "Wired or no wireless link detected."
+        if wifi and wifi.get("error"):
+            note += f' ({_esc(wifi["error"])})'
+        return f'<div class="uplink-card"><div class="exp-ip">Uplink</div>' \
+               f'<p class="dim">{note}</p></div>'
+
+    dbm = wifi.get("signal_dbm")
+    pct = wifi.get("signal_pct")
+    sig_txt = "—"
+    if dbm is not None or pct is not None:
+        bits = []
+        if dbm is not None:
+            bits.append(f"{_esc(dbm)} dBm")
+        if pct is not None:
+            bits.append(f"{_esc(pct)}%")
+        q = wifi.get("signal_quality")
+        if q:
+            bits.append(f"({_esc(q)})")
+        sig_txt = " ".join(bits) + _signal_bar(pct)
+
+    rate = "—"
+    if wifi.get("tx_rate_mbps") or wifi.get("rx_rate_mbps"):
+        rate = (f'↑ {_esc(wifi.get("tx_rate_mbps") or "—")} / '
+                f'↓ {_esc(wifi.get("rx_rate_mbps") or "—")} Mbps')
+    chan = wifi.get("channel")
+    if chan and wifi.get("channel_width_mhz"):
+        chan = f'{chan} ({_esc(wifi["channel_width_mhz"])} MHz wide)'
+
+    rows = [
+        ("SSID", wifi.get("ssid")),
+        ("BSSID (AP radio)", wifi.get("bssid")),
+        ("Signal", sig_txt),
+        ("Band", wifi.get("band")),
+        ("Channel", chan),
+        ("Frequency", f'{_esc(wifi["frequency_mhz"])} MHz' if wifi.get("frequency_mhz") else None),
+        ("PHY / mode", wifi.get("phy_mode")),
+        ("Security", wifi.get("security")),
+        ("Link rate", rate),
+        ("Tx power", f'{_esc(wifi["tx_power_dbm"])} dBm' if wifi.get("tx_power_dbm") else None),
+        ("SNR", f'{_esc(wifi["snr_db"])} dB' if wifi.get("snr_db") is not None else None),
+        ("Noise", f'{_esc(wifi["noise_dbm"])} dBm' if wifi.get("noise_dbm") is not None else None),
+        ("Beacon interval", wifi.get("beacon_interval")),
+        ("DTIM period", wifi.get("dtim_period")),
+        ("BSS flags", wifi.get("bss_flags")),
+        ("Interface", wifi.get("interface")),
+    ]
+    body = "".join(
+        f'<div class="exp-grp"><span class="exp-lbl">{_esc(k)}</span>'
+        f'<span class="exp-svc">{v if k == "Signal" else _esc(v)}</span></div>'
+        for k, v in rows if v not in (None, "", "—") or k == "Signal"
+    )
+    return (f'<div class="uplink-card"><div class="exp-ip">📶 Wireless uplink → '
+            f'{_esc(wifi.get("ssid") or "router")}</div>{body}</div>')
+
+
+def _router_panel(gw_info: Dict[str, Any]) -> str:
+    if not gw_info or not gw_info.get("ip"):
+        return ""
+    rows = [
+        ("Gateway IP", gw_info.get("ip")),
+        ("MAC (ARP)", gw_info.get("mac")),
+        ("Vendor", gw_info.get("vendor")),
+        ("Name", gw_info.get("device_name")),
+        ("ARP state", gw_info.get("arp_state")),
+        ("Local interface", gw_info.get("interface")),
+        ("Uplink", gw_info.get("uplink")),
+        ("Open ports", ", ".join(map(str, gw_info.get("open_ports") or [])) or None),
+    ]
+    body = "".join(
+        f'<div class="exp-grp"><span class="exp-lbl">{_esc(k)}</span>'
+        f'<span class="exp-svc">{_esc(v)}</span></div>'
+        for k, v in rows if v not in (None, "")
+    )
+    return f'<div class="uplink-card"><div class="exp-ip">🌐 Router / gateway</div>{body}</div>'
+
+
+def _neighbors_block(report: Dict[str, Any]) -> str:
+    """ARP / NDP neighbor table rendered as a tidy sortable table."""
+    nb = report.get("neighbors") or {}
+    neighbors = nb.get("neighbors") or []
+    if not neighbors:
+        return ""
+    gw = (report.get("routes") or {}).get("default_gateway")
+    rows = ""
+    for n in sorted(neighbors, key=lambda x: (x.get("version", 4), str(x.get("ip")))):
+        tag = ' <span class="badge role-tag">gateway</span>' if n.get("ip") == gw else ""
+        rows += (
+            f'<tr><td>{_esc(n.get("ip"))}{tag}</td>'
+            f'<td>{_esc(n.get("mac") or "—")}</td>'
+            f'<td>IPv{_esc(n.get("version") or 4)}</td>'
+            f'<td>{_esc(n.get("interface") or "—")}</td>'
+            f'<td>{_esc(n.get("state") or "—")}</td></tr>'
+        )
+    return _section(
+        f"ARP / NDP Neighbors ({len(neighbors)})",
+        '<table><thead><tr><th>IP</th><th>MAC</th><th>Family</th>'
+        f'<th>Interface</th><th>State</th></tr></thead><tbody>{rows}</tbody></table>')
+
+
+def _kv_table(rows: List[Tuple[str, Any]]) -> str:
+    body = "".join(
+        f'<tr><td class="dim">{_esc(k)}</td><td>{v if isinstance(v, str) and "<" in v else _esc(v)}</td></tr>'
+        for k, v in rows if v not in (None, "", [])
+    )
+    return f'<table>{body}</table>'
+
+
+def _wireless_block(report: Dict[str, Any]) -> str:
+    w = report.get("wireless") or {}
+    aps = w.get("survey") or []
+    if not aps:
+        return ""
+    ana = w.get("analysis") or {}
+    rows = ""
+    for a in aps[:60]:
+        tag = ' <span class="badge self">connected</span>' if a.get("connected") else ""
+        rogue = ' <span class="sev sev-high">rogue?</span>' if a in (ana.get("rogue_aps") or []) else ""
+        rows += (
+            f'<tr><td>{_esc(a.get("ssid") or "—")}{tag}{rogue}</td>'
+            f'<td class="mono">{_esc(a.get("bssid"))}</td>'
+            f'<td>{_esc(a.get("vendor") or "")}</td>'
+            f'<td>{_esc(a.get("signal_dbm"))} dBm{_signal_bar(a.get("signal_pct"))}</td>'
+            f'<td>{_esc(a.get("band") or "")} ch {_esc(a.get("channel") or "?")}</td>'
+            f'<td>{_esc(a.get("security") or "")}{" ⚠WPS" if a.get("wps") else ""}</td></tr>'
+        )
+    rec = ana.get("recommended_channel_24ghz")
+    hdr = (f'<p class="dim">{len(aps)} AP(s) nearby.'
+           + (f' Recommended 2.4 GHz channel: <b>{_esc(rec)}</b>.' if rec else "") + '</p>')
+    return _section("Wireless Survey",
+        hdr + '<table><thead><tr><th>SSID</th><th>BSSID</th><th>Vendor</th>'
+        '<th>Signal</th><th>Band/Ch</th><th>Security</th></tr></thead>'
+        f'<tbody>{rows}</tbody></table>')
+
+
+def _linkqual_block(report: Dict[str, Any]) -> str:
+    lq = report.get("link_quality") or {}
+    if not lq:
+        return ""
+    rows = ""
+    for name, d in (("Gateway", lq.get("gateway")), ("Internet", lq.get("internet"))):
+        if not d:
+            continue
+        rows += (
+            f'<tr><td>{_esc(name)} ({_esc(d.get("ip"))})</td>'
+            f'<td>{_esc(d.get("avg_ms"))} ms</td><td>{_esc(d.get("jitter_ms"))} ms</td>'
+            f'<td>{_esc(d.get("min_ms"))}/{_esc(d.get("max_ms"))} ms</td>'
+            f'<td>{_esc(d.get("loss_pct"))}%</td></tr>'
+        )
+    return _section("Link Quality",
+        '<table><thead><tr><th>Target</th><th>Avg latency</th><th>Jitter</th>'
+        f'<th>Min/Max</th><th>Loss</th></tr></thead><tbody>{rows}</tbody></table>')
+
+
+def _path_block(report: Dict[str, Any]) -> str:
+    path = report.get("path") or {}
+    inet = path.get("internet") or {}
+    hops = inet.get("hops") or []
+    if not hops:
+        return ""
+    rows = "".join(
+        f'<tr><td>{_esc(h.get("hop"))}</td>'
+        f'<td class="mono">{_esc(h.get("ip") or "*")}</td>'
+        f'<td>{_esc(h.get("rtt_ms"))} ms</td>'
+        f'<td>{"private" if h.get("private") else ("public" if h.get("ip") else "—")}</td></tr>'
+        for h in hops
+    )
+    summary = (f'<p class="dim">{_esc(path.get("hop_count"))} hops to the internet · '
+               f'ISP edge {_esc(path.get("isp_edge_ip") or "?")}'
+               + (' · <span class="sev sev-medium">double-NAT</span>' if path.get("double_nat") else '')
+               + '</p>')
+    return _section("Network Path (traceroute)",
+        summary + '<table><thead><tr><th>Hop</th><th>IP</th><th>RTT</th>'
+        f'<th>Scope</th></tr></thead><tbody>{rows}</tbody></table>')
+
+
+def _wanexp_block(report: Dict[str, Any]) -> str:
+    wan = report.get("wan_exposure") or {}
+    if not wan.get("igd_found"):
+        return ""
+    maps = wan.get("port_mappings") or []
+    rows = "".join(
+        f'<tr><td>{_esc(m.get("external_port"))}/{_esc(m.get("protocol"))}</td>'
+        f'<td class="mono">{_esc(m.get("internal_client"))}:{_esc(m.get("internal_port"))}</td>'
+        f'<td>{_esc(m.get("description") or "")}</td>'
+        f'<td>{"yes" if m.get("enabled") in ("1","true","True") else _esc(m.get("enabled"))}</td></tr>'
+        for m in maps
+    ) or '<tr><td colspan="4" class="dim">No active port forwards.</td></tr>'
+    hdr = f'<p class="dim">Router external IP: <b>{_esc(wan.get("external_ip") or "?")}</b></p>'
+    return _section("WAN Exposure (UPnP IGD)",
+        hdr + '<table><thead><tr><th>External</th><th>→ Internal</th>'
+        f'<th>Description</th><th>Enabled</th></tr></thead><tbody>{rows}</tbody></table>')
+
+
+def _bluetooth_block(report: Dict[str, Any]) -> str:
+    bt = report.get("bluetooth") or {}
+    devs = bt.get("devices") or []
+    if not devs:
+        return ""
+    rows = "".join(
+        f'<tr><td class="mono">{_esc(d.get("address"))}</td>'
+        f'<td>{_esc(d.get("name") or "—")}</td>'
+        f'<td>{_esc(d.get("vendor") or "")}</td>'
+        f'<td>{"●" if d.get("connected") else ""}</td></tr>'
+        for d in devs
+    )
+    return _section(f"Bluetooth / BLE ({len(devs)})",
+        '<table><thead><tr><th>Address</th><th>Name</th><th>Vendor</th>'
+        f'<th>Conn</th></tr></thead><tbody>{rows}</tbody></table>')
+
+
+def _lifecycle_block(report: Dict[str, Any]) -> str:
+    lc = report.get("lifecycle") or {}
+    by_host = lc.get("by_host") or {}
+    if not by_host:
+        return ""
+    rows = ""
+    for ip, items in by_host.items():
+        for it in items:
+            status = ('<span class="sev sev-high">EOL</span>' if it.get("is_eol")
+                      else '<span class="sev sev-low">supported</span>' if it.get("is_eol") is False
+                      else "—")
+            rows += (f'<tr><td>{_esc(ip)}</td><td>{_esc(it.get("product"))} {_esc(it.get("version"))}</td>'
+                     f'<td>{_esc(it.get("eol"))}</td><td>{status}</td>'
+                     f'<td>{_esc(it.get("latest") or "")}</td></tr>')
+    return _section("Software Lifecycle (EOL)",
+        '<table><thead><tr><th>Host</th><th>Component</th><th>EOL date</th>'
+        f'<th>Status</th><th>Latest</th></tr></thead><tbody>{rows}</tbody></table>')
+
+
+def _topology_extras(topo: Dict[str, Any]) -> str:
+    out = ""
+    segs = topo.get("segments") or []
+    if len(segs) > 1 or (segs and segs[0].get("cidr") != "other"):
+        srows = "".join(
+            f'<tr><td class="mono">{_esc(s.get("cidr"))}</td><td>{_esc(s.get("host_count"))}</td></tr>'
+            for s in segs)
+        out += ('<h3>Segments</h3><table><thead><tr><th>Subnet</th><th>Hosts</th>'
+                f'</tr></thead><tbody>{srows}</tbody></table>')
+    sw = topo.get("switches") or []
+    if sw:
+        wrows = "".join(
+            f'<tr><td>{_esc(s.get("system_name") or s.get("chassis_id"))}</td>'
+            f'<td>{_esc(s.get("port_id") or "")}</td><td>{_esc(s.get("vlan") or "")}</td>'
+            f'<td class="mono">{_esc(s.get("mgmt_addr") or "")}</td>'
+            f'<td>{_esc(s.get("protocol"))}</td></tr>' for s in sw)
+        out += ('<h3>Layer-2 Switches (LLDP/CDP)</h3><table><thead><tr><th>Switch</th>'
+                '<th>Port</th><th>VLAN</th><th>Mgmt IP</th><th>Proto</th></tr></thead>'
+                f'<tbody>{wrows}</tbody></table>')
+    crit = [c for c in (topo.get("critical_nodes") or []) if c.get("spof")]
+    if crit:
+        out += '<h3>Critical Nodes / SPOF</h3><ul class="topo">' + "".join(
+            f'<li>⚠ <b>{_esc(c.get("ip"))}</b> <span class="dim">— {_esc(", ".join(c.get("reasons", [])))}</span></li>'
+            for c in crit) + '</ul>'
+    comm = topo.get("comm_edges") or []
+    if comm:
+        crows = "".join(
+            f'<tr><td class="mono">{_esc(c.get("from"))}</td><td class="mono">{_esc(c.get("to"))}</td>'
+            f'<td>{_esc(c.get("packets"))}</td></tr>' for c in comm[:40])
+        out += ('<h3>Observed Conversations (passive)</h3><table><thead><tr><th>A</th>'
+                f'<th>B</th><th>Packets</th></tr></thead><tbody>{crows}</tbody></table>')
+    return out
+
+
+def _passive_extras_block(report: Dict[str, Any]) -> str:
+    ex = report.get("passive_extras") or {}
+    vlans = ex.get("vlans") or []
+    osfp = ex.get("os_fingerprints") or {}
+    if not vlans and not osfp:
+        return ""
+    parts = ""
+    if vlans:
+        parts += f'<p><b>VLANs seen:</b> {_esc(", ".join(map(str, vlans)))}</p>'
+    if osfp:
+        rows = "".join(f'<tr><td class="mono">{_esc(ip)}</td><td>{_esc(g)}</td></tr>'
+                       for ip, g in osfp.items())
+        parts += ('<table><thead><tr><th>Host</th><th>Passive OS guess</th></tr></thead>'
+                  f'<tbody>{rows}</tbody></table>')
+    return _section("Passive Fingerprints & VLANs", parts)
+
+
+def _router_audit_block(report: Dict[str, Any]) -> str:
+    ra = report.get("router_audit") or {}
+    admin = ra.get("admin")
+    if not admin and not ra.get("findings"):
+        return ""
+    rows = [
+        ("Gateway", ra.get("gateway")),
+        ("Admin URL", (admin or {}).get("url")),
+        ("Server", (admin or {}).get("server")),
+        ("Auth realm", (admin or {}).get("realm")),
+        ("Title", (admin or {}).get("title")),
+        ("Default creds accepted",
+         ", ".join(f"{u}/{p or '<blank>'}" for u, p in ra.get("default_creds", [])) or None),
+    ]
+    body = "".join(
+        f'<div class="exp-grp"><span class="exp-lbl">{_esc(k)}</span>'
+        f'<span class="exp-svc">{_esc(v)}</span></div>'
+        for k, v in rows if v not in (None, ""))
+    return _section("Router / Gateway Audit",
+        f'<div class="uplink-card">{body}</div>')
+
+
+def _trends_block(report: Dict[str, Any]) -> str:
+    tr = report.get("trends") or {}
+    tl = tr.get("topology_timeline") or {}
+    st = tr.get("signal_trend") or {}
+    if not tl.get("nodes") and not st.get("series"):
+        return ""
+    parts = f'<p class="dim">{_esc(tr.get("scan_count", 0))} scans compared.</p>'
+    if st.get("delta_db") is not None:
+        arrow = "▼" if st["trend"] == "degraded" else "▲" if st["trend"] == "improved" else "▬"
+        parts += (f'<p><b>Wi-Fi signal trend:</b> {arrow} {_esc(st["trend"])} '
+                  f'({_esc(st.get("baseline_dbm"))} → {_esc(st.get("latest_dbm"))} dBm, '
+                  f'Δ {_esc(st.get("delta_db"))} dB over {_esc(st.get("samples"))} samples)</p>')
+    if tl.get("added_last") or tl.get("removed_last"):
+        parts += ('<p><b>Since last scan:</b> '
+                  f'<span class="ok">+{len(tl.get("added_last", []))} new</span>, '
+                  f'<span class="dim">-{len(tl.get("removed_last", []))} gone</span></p>')
+    new_nodes = [n for n in tl.get("nodes", []) if n.get("status") == "new"]
+    if new_nodes:
+        rows = "".join(
+            f'<tr><td class="mono">{_esc(n["ip"])}</td><td>{_esc(n["status"])}</td>'
+            f'<td>{_esc(n["first_seen"])}</td><td>{_esc(int(n["frequency"]*100))}%</td></tr>'
+            for n in tl["nodes"] if n["status"] in ("new", "left"))
+        parts += ('<table><thead><tr><th>Host</th><th>Status</th><th>First seen</th>'
+                  f'<th>Presence</th></tr></thead><tbody>{rows}</tbody></table>')
+    return _section("Trends Over Time", parts)
+
+
 def _exposure_block(report: Dict[str, Any]) -> str:
     by_host = (report.get("hygiene") or {}).get("by_host", {})
     cards = ""
@@ -354,15 +712,28 @@ def render_html(report: Dict[str, Any]) -> str:
     topo_block = ""
     topo = report.get("topology")
     if topo and topo.get("nodes"):
-        items = "".join(
-            f'<li>{_esc(n.get("icon") or "")} <b>{_esc(n.get("label"))}</b> '
-            f'<span class="dim">{_esc(n.get("ip") or "")}</span> '
-            f'<span class="role role-{_esc(n.get("role"))}">{_esc(n.get("role"))}</span></li>'
-            for n in topo["nodes"]
-        )
+        def _topo_li(n: Dict[str, Any]) -> str:
+            mac = (f'<span class="dim mono">{_esc(n.get("mac"))}</span> '
+                   if n.get("mac") else "")
+            return (
+                f'<li>{_esc(n.get("icon") or "")} <b>{_esc(n.get("label"))}</b> '
+                f'<span class="dim">{_esc(n.get("ip") or "")}</span> {mac}'
+                f'<span class="role role-{_esc(n.get("role"))}">{_esc(n.get("role"))}</span></li>'
+            )
+        items = "".join(_topo_li(n) for n in topo["nodes"])
+        gw_info = topo.get("gateway_info") or {}
+        uplink = (f'<div class="uplink-grid">{_router_panel(gw_info)}'
+                  f'{_wifi_panel(report.get("wifi") or topo.get("wifi") or {}, gw_info)}</div>')
+        try:
+            from . import topology as _topo_mod
+            mermaid = _topo_mod.to_mermaid(topo)
+        except Exception:
+            mermaid = ""
+        mer_html = (f'<details><summary>Mermaid graph (copy into mermaid.live)</summary>'
+                    f'<pre>{_esc(mermaid)}</pre></details>' if mermaid else "")
         topo_block = _section(
             f"Topology ({_esc(topo.get('node_count'))} nodes, gateway {_esc(topo.get('gateway'))})",
-            f'<ul class="topo">{items}</ul>')
+            f'{uplink}<ul class="topo">{items}</ul>{_topology_extras(topo)}{mer_html}')
 
     # SSDP / UPnP
     ssdp_block = ""
@@ -413,7 +784,11 @@ def render_html(report: Dict[str, Any]) -> str:
         f'{_findings_table(report)}'
         f'{_section("Host Inventory", host_table)}'
         f'{_exposure_block(report)}'
-        f'{cve_block}{topo_block}{ssdp_block}{passive_block}{pentest_block}'
+        f'{cve_block}{topo_block}{_neighbors_block(report)}'
+        f'{_wireless_block(report)}{_linkqual_block(report)}{_path_block(report)}'
+        f'{_wanexp_block(report)}{_router_audit_block(report)}{_lifecycle_block(report)}'
+        f'{_bluetooth_block(report)}{_trends_block(report)}'
+        f'{_passive_extras_block(report)}{ssdp_block}{passive_block}{pentest_block}'
         f'{_section("Full Report (JSON)", f"<pre>{_esc(json.dumps(report, indent=2, ensure_ascii=False))}</pre>")}'
         f'<script>{_JS}</script>'
         f'</body></html>'
@@ -469,6 +844,121 @@ def render_markdown(report: Dict[str, Any]) -> str:
                      f"{h.get('vendor') or ''} | {h.get('device_type') or ''} | "
                      f"{ports} | {risks or '—'} |")
     lines.append("")
+
+    # Router / wireless uplink
+    routes = report.get("routes") or {}
+    wifi = report.get("wifi") or {}
+    gw = routes.get("default_gateway")
+    topo = report.get("topology") or {}
+    gw_info = topo.get("gateway_info") or {}
+    if gw or wifi.get("connected"):
+        lines.append("## Router / Uplink")
+        lines.append("")
+        lines.append(f"- **Gateway:** {gw or '—'}"
+                     + (f" ({gw_info.get('mac')})" if gw_info.get("mac") else ""))
+        if gw_info.get("vendor"):
+            lines.append(f"- **Gateway vendor:** {gw_info['vendor']}")
+        if wifi.get("connected"):
+            sig = wifi.get("signal_dbm")
+            sig_s = (f"{sig} dBm" if sig is not None else "—")
+            if wifi.get("signal_pct") is not None:
+                sig_s += f" / {wifi['signal_pct']}%"
+            if wifi.get("signal_quality"):
+                sig_s += f" ({wifi['signal_quality']})"
+            lines.append(f"- **SSID:** {wifi.get('ssid') or '—'}")
+            lines.append(f"- **BSSID:** {wifi.get('bssid') or '—'}")
+            lines.append(f"- **Signal:** {sig_s}")
+            band = wifi.get("band")
+            chan = wifi.get("channel")
+            if band or chan:
+                lines.append(f"- **Band / channel:** {band or '—'} / {chan or '—'}")
+            if wifi.get("tx_rate_mbps") or wifi.get("rx_rate_mbps"):
+                lines.append(f"- **Link rate:** ↑ {wifi.get('tx_rate_mbps') or '—'} / "
+                             f"↓ {wifi.get('rx_rate_mbps') or '—'} Mbps")
+            if wifi.get("security"):
+                lines.append(f"- **Security:** {wifi['security']}")
+        else:
+            lines.append("- **Uplink:** wired or no wireless link detected")
+        lines.append("")
+
+    # ARP / NDP neighbors
+    neighbors = (report.get("neighbors") or {}).get("neighbors") or []
+    if neighbors:
+        lines.append("## ARP / NDP Neighbors")
+        lines.append("")
+        lines.append("| IP | MAC | Family | Interface | State |")
+        lines.append("|---|---|---|---|---|")
+        for n in sorted(neighbors, key=lambda x: (x.get("version", 4), str(x.get("ip")))):
+            lines.append(f"| {n.get('ip','')} | {n.get('mac') or '—'} | "
+                         f"IPv{n.get('version', 4)} | {n.get('interface') or '—'} | "
+                         f"{n.get('state') or '—'} |")
+        lines.append("")
+
+    # Wireless survey
+    wsurvey = (report.get("wireless") or {}).get("survey") or []
+    wana = (report.get("wireless") or {}).get("analysis") or {}
+    if wsurvey:
+        lines.append("## Wireless Survey")
+        lines.append("")
+        if wana.get("recommended_channel_24ghz"):
+            lines.append(f"_Recommended 2.4 GHz channel: {wana['recommended_channel_24ghz']}_")
+            lines.append("")
+        lines.append("| SSID | BSSID | Signal | Band/Ch | Security |")
+        lines.append("|---|---|---|---|---|")
+        for a in wsurvey[:40]:
+            lines.append(f"| {a.get('ssid') or '—'} | {a.get('bssid')} | "
+                         f"{a.get('signal_dbm')} dBm | {a.get('band') or ''} ch{a.get('channel') or '?'} | "
+                         f"{a.get('security') or ''}{' WPS' if a.get('wps') else ''} |")
+        lines.append("")
+
+    # Link quality
+    lq = report.get("link_quality") or {}
+    if lq:
+        lines.append("## Link Quality")
+        lines.append("")
+        for name, d in (("Gateway", lq.get("gateway")), ("Internet", lq.get("internet"))):
+            if d:
+                lines.append(f"- **{name}** ({d.get('ip')}): {d.get('avg_ms')} ms avg, "
+                             f"{d.get('jitter_ms')} ms jitter, {d.get('loss_pct')}% loss")
+        lines.append("")
+
+    # Network path
+    path = report.get("path") or {}
+    if path.get("internet", {}).get("hops"):
+        lines.append("## Network Path")
+        lines.append("")
+        lines.append(f"- **Hops to internet:** {path.get('hop_count')}")
+        lines.append(f"- **ISP edge:** {path.get('isp_edge_ip') or '?'}")
+        if path.get("double_nat"):
+            lines.append("- ⚠ **Double-NAT detected**")
+        lines.append("")
+
+    # WAN exposure
+    wan = report.get("wan_exposure") or {}
+    if wan.get("igd_found"):
+        lines.append("## WAN Exposure (UPnP IGD)")
+        lines.append("")
+        lines.append(f"- **External IP:** {wan.get('external_ip') or '?'}")
+        for m in wan.get("port_mappings") or []:
+            lines.append(f"- {m.get('external_port')}/{m.get('protocol')} → "
+                         f"{m.get('internal_client')}:{m.get('internal_port')} "
+                         f"({m.get('description') or '?'})")
+        lines.append("")
+
+    # Lifecycle
+    lc_by = (report.get("lifecycle") or {}).get("by_host") or {}
+    if lc_by:
+        lines.append("## Software Lifecycle")
+        lines.append("")
+        lines.append("| Host | Component | EOL | Status |")
+        lines.append("|---|---|---|---|")
+        for ip, items in lc_by.items():
+            for it in items:
+                st = "EOL" if it.get("is_eol") else "supported" if it.get("is_eol") is False else "?"
+                lines.append(f"| {ip} | {it.get('product')} {it.get('version')} | "
+                             f"{it.get('eol')} | {st} |")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -529,6 +1019,13 @@ border-radius:8px;font-size:12px}
 .exp-grp{display:flex;gap:8px;font-size:12px;padding:2px 0}
 .exp-lbl{width:130px;color:var(--dim)}.exp-svc{flex:1}
 .exp-notes{margin-top:8px;font-size:12px;color:#f59e0b}
+.uplink-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+gap:12px;margin-bottom:16px}
+.uplink-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+.mono{font-family:ui-monospace,monospace;font-size:12px}
+.sig-track{display:inline-block;vertical-align:middle;width:90px;height:8px;
+background:var(--panel2);border-radius:5px;overflow:hidden;margin-left:8px}
+.sig-fill{display:block;height:100%;border-radius:5px}
 """
 
 _JS = """

@@ -16,8 +16,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from . import (
-    discovery, enrichment, hygiene, intel, netinfo, passive as passive_mod,
-    ports, ssdp as ssdp_mod, tags as tags_mod, topology, zeroconf_disc,
+    anomaly, bluetooth as bluetooth_mod, discovery, enrichment, hygiene, intel,
+    l2disc, lifecycle as lifecycle_mod, linkqual, netinfo, passive as passive_mod,
+    pathmap, ports, ssdp as ssdp_mod, tags as tags_mod, topology, wanexp,
+    wireless, zeroconf_disc,
 )
 from .primitives import check_privileges, guess_os_from_ttl
 
@@ -53,11 +55,26 @@ class EngineOptions:
     passive: bool = False
     passive_duration: float = 20.0
     passive_interface: Optional[str] = None
+    pcap: bool = False                    # retain frames + write a .pcap (with passive)
+    pcap_path: Optional[str] = None       # where to write the capture
+    # Wireless / RF
+    wireless_survey: bool = False         # survey nearby APs + channel/rogue analysis
+    bluetooth: bool = False               # scan nearby Bluetooth/BLE devices
+    bluetooth_duration: float = 8.0
+    # Layer-2 / path / link
+    lldp: bool = False                    # passive LLDP/CDP switch discovery (root)
+    lldp_duration: float = 35.0
+    traceroute: bool = False              # path map to gateway + internet
+    link_quality: bool = False            # latency/jitter/loss to gw + internet
+    wan_exposure: bool = False            # UPnP IGD port-forward enumeration
+    router_audit: bool = False            # gateway admin-surface + default-cred audit
+    authorized: bool = False              # consent for active checks (router cred test)
     # Intelligence
     cve: bool = False
     cve_min_score: float = 6.0
     cve_results_per_query: int = 10
     cve_kev: bool = True
+    lifecycle: bool = False               # endoflife.date version checks
     topology: bool = False
     # Analysis
     hygiene: bool = True                  # derived findings + exposure (free)
@@ -118,6 +135,7 @@ def run_engine(opts: EngineOptions, stage_cb: StageCb = None,
     report["privileges"] = check_privileges()
     report["interfaces"] = netinfo.get_interfaces()
     report["routes"] = netinfo.get_routes_and_gateway()
+    report["wifi"] = netinfo.get_wifi_info()
     report["dns_servers"] = netinfo.get_dns_servers()
     report["neighbors"] = netinfo.get_neighbor_table(include_ipv6=opts.ipv6)
     report["listening_ports"] = netinfo.get_listening_ports()
@@ -125,6 +143,33 @@ def run_engine(opts: EngineOptions, stage_cb: StageCb = None,
     local_nets = netinfo.get_local_ipv4_networks()
     report["local_networks"] = local_nets
     self_ips = netinfo.get_local_ipv4_addresses()
+    gateway = (report.get("routes") or {}).get("default_gateway")
+
+    # ── Local vantage / RF extras (independent of host discovery) ──────────────
+    if opts.wireless_survey:
+        stage("Wireless survey")
+        conn = report.get("wifi") or {}
+        aps = wireless.survey(conn.get("bssid"))
+        report["wireless"] = {"survey": aps, "analysis": wireless.analyze(aps, conn)}
+
+    if opts.lldp:
+        ok, why = l2disc.available()
+        if ok:
+            report["l2_neighbors"] = l2disc.listen(opts.lldp_duration, stage_cb=stage_cb)
+        else:
+            stage(f"LLDP/CDP skipped — {why}")
+
+    if opts.traceroute:
+        report["path"] = pathmap.map_paths(gateway, stage_cb=stage_cb)
+
+    if opts.link_quality:
+        report["link_quality"] = linkqual.measure(gateway, stage_cb=stage_cb)
+
+    if opts.wan_exposure:
+        report["wan_exposure"] = wanexp.assess(stage_cb=stage_cb)
+
+    if opts.bluetooth:
+        report["bluetooth"] = bluetooth_mod.scan(opts.bluetooth_duration, stage_cb=stage_cb)
 
     discovery_block: Dict[str, Any] = {"performed": False, "subnets": [], "hosts": [],
                                        "mode": opts.discovery_mode}
@@ -158,8 +203,9 @@ def run_engine(opts: EngineOptions, stage_cb: StageCb = None,
             ok, why = passive_mod.available()
             if ok:
                 stage(f"Passive sniff ({opts.passive_duration:.0f}s)")
-                passive_result = passive_mod.sniff(opts.passive_duration,
-                                                   opts.passive_interface, stage_cb)
+                passive_result = passive_mod.sniff(
+                    opts.passive_duration, opts.passive_interface, stage_cb,
+                    capture_pcap=opts.pcap)
             else:
                 stage(f"Passive sniff skipped — {why}")
 
@@ -192,6 +238,16 @@ def run_engine(opts: EngineOptions, stage_cb: StageCb = None,
         if passive_result is not None:
             stage("Merging passive observations")
             hosts = _merge_passive(hosts, passive_result.to_list(), self_ips)
+            extras = passive_result.extras()
+            report["passive_extras"] = extras
+            report["dhcp_servers"] = extras.get("dhcp_servers", [])
+            osfp = extras.get("os_fingerprints", {})
+            for h in hosts:
+                if osfp.get(h["ip"]) and not h.get("os_guess"):
+                    h["os_guess"] = osfp[h["ip"]]
+            if opts.pcap and opts.pcap_path:
+                report["pcap_path"] = passive_mod.write_pcap(passive_result,
+                                                             opts.pcap_path)
 
         asset_tags = tags_mod.load_tags(opts.tags_file)
         if asset_tags:
@@ -210,9 +266,20 @@ def run_engine(opts: EngineOptions, stage_cb: StageCb = None,
             results_per_query=opts.cve_results_per_query, use_kev=opts.cve_kev,
         )
 
+    if opts.lifecycle and hosts:
+        stage("Checking software lifecycle (endoflife.date)")
+        report["lifecycle"] = lifecycle_mod.enrich(report, stage_cb=stage_cb)
+
     if opts.topology and hosts:
         stage("Building topology")
-        report["topology"] = topology.build(hosts, report.get("routes", {}))
+        report["topology"] = topology.build(
+            hosts, report.get("routes", {}),
+            wifi=report.get("wifi"), neighbors=report.get("neighbors"),
+            local_networks=report.get("local_networks"),
+            dns_servers=report.get("dns_servers"),
+            l2_neighbors=report.get("l2_neighbors"),
+            conversations=(report.get("passive_extras") or {}).get("conversations"),
+            ap_survey=(report.get("wireless") or {}).get("survey"))
 
     stage("Public IP")
     report["public_ip"] = netinfo.get_public_ip()
@@ -220,6 +287,13 @@ def run_engine(opts: EngineOptions, stage_cb: StageCb = None,
     if opts.hygiene:
         stage("Analyzing hygiene & exposure")
         report["hygiene"] = hygiene.analyze(report)
+        # Fold in the always-free anomaly + opt-in wireless/WAN/lifecycle findings.
+        extra: List[Dict[str, Any]] = list(anomaly.analyze(report))
+        extra += (report.get("wireless") or {}).get("analysis", {}).get("findings", [])
+        extra += (report.get("wan_exposure") or {}).get("findings", [])
+        extra += (report.get("lifecycle") or {}).get("findings", [])
+        if extra:
+            hygiene.fold_in_findings(report, extra)
 
     # External intelligence (opt-in network I/O against public IPs).
     if opts.extintel and hosts:

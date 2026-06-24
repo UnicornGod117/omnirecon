@@ -859,6 +859,13 @@ class PassiveSniffResult:
         # ip → {mac, names: set, services: set, protocols: set}
         self.hosts: Dict[str, Dict[str, Any]] = {}
         self.packet_counts: Dict[str, int] = {}
+        # Extended passive intel (v6.1).
+        self.conversations: Dict[Tuple[str, str], int] = {}
+        self.vlans: Set[int] = set()
+        self.dhcp_servers: Set[str] = set()
+        self.os_fingerprints: Dict[str, str] = {}
+        self.pcap: List[Any] = []
+        self.capture_pcap: bool = False
 
     def _ensure(self, ip: str) -> Dict[str, Any]:
         if ip not in self.hosts:
@@ -880,6 +887,43 @@ class PassiveSniffResult:
             if protocol: h["protocols"].add(protocol)
             self.packet_counts[ip] = self.packet_counts.get(ip, 0) + 1
 
+    def observe_conversation(self, src: str, dst: str) -> None:
+        if not (is_private_or_lan_ip(src) and is_private_or_lan_ip(dst)) or src == dst:
+            return
+        key = tuple(sorted((src, dst)))
+        with self._lock:
+            self.conversations[key] = self.conversations.get(key, 0) + 1
+
+    def observe_vlan(self, vlan_id: int) -> None:
+        if vlan_id:
+            with self._lock:
+                self.vlans.add(int(vlan_id))
+
+    def observe_dhcp_server(self, ip: str) -> None:
+        if ip and is_private_or_lan_ip(ip):
+            with self._lock:
+                self.dhcp_servers.add(ip)
+
+    def observe_osfp(self, ip: str, guess: str) -> None:
+        if ip and guess:
+            with self._lock:
+                self.os_fingerprints.setdefault(ip, guess)
+
+    def conversation_list(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return sorted(({"a": a, "b": b, "packets": n}
+                           for (a, b), n in self.conversations.items()),
+                          key=lambda c: c["packets"], reverse=True)
+
+    def extras(self) -> Dict[str, Any]:
+        with self._lock:
+            convs = sorted(({"a": a, "b": b, "packets": n}
+                            for (a, b), n in self.conversations.items()),
+                           key=lambda c: c["packets"], reverse=True)
+            return {"conversations": convs, "vlans": sorted(self.vlans),
+                    "dhcp_servers": sorted(self.dhcp_servers),
+                    "os_fingerprints": dict(self.os_fingerprints)}
+
     def to_list(self) -> List[Dict[str, Any]]:
         with self._lock:
             out = []
@@ -891,6 +935,7 @@ class PassiveSniffResult:
                     "services": sorted(h["services"]),
                     "protocols": sorted(h["protocols"]),
                     "packet_count": self.packet_counts.get(ip, 0),
+                    "os_fingerprint": self.os_fingerprints.get(ip),
                 })
             return sorted(out, key=lambda x: _ip_sort_key_str(x["ip"]))
 
@@ -952,10 +997,13 @@ def _ip_sort_key_str(ip: str) -> Tuple:
 
 def passive_sniff(duration_s: float,
                   interface: Optional[str] = None,
-                  progress: bool = True) -> PassiveSniffResult:
+                  progress: bool = True,
+                  capture_pcap: bool = False) -> PassiveSniffResult:
     """
     Capture packets passively for duration_s seconds.
-    Harvests: ARP, mDNS, NetBIOS NS, SSDP, DHCP, LLMNR.
+    Harvests: ARP, mDNS, NetBIOS NS, SSDP, DHCP, LLMNR, conversations,
+    VLAN tags, DHCP servers, and passive OS fingerprints.
+    With capture_pcap=True, retains frames so a .pcap can be written.
     Returns a PassiveSniffResult with everything observed.
     """
     result = PassiveSniffResult()
@@ -1000,16 +1048,21 @@ def passive_sniff(duration_s: float,
             _handle_ssdp_passive(pkt, result)
             _handle_dhcp(pkt, result)
             _handle_llmnr(pkt, result)
+            _handle_conversation(pkt, result)
+            _handle_vlan(pkt, result)
+            _handle_osfp(pkt, result)
+            if capture_pcap:
+                result.pcap.append(pkt)
         except Exception:
             pass
 
     try:
         iface_kwarg = {"iface": interface} if interface else {}
+        # Broader filter so TCP SYNs (OS fingerprint) and conversations are seen.
         scapy.sniff(
             prn=handle_packet,
             timeout=duration_s,
             store=False,
-            filter="arp or udp or (ip and icmp)",
             **iface_kwarg
         )
     except Exception as e:
@@ -1221,17 +1274,16 @@ def _handle_ssdp_passive(pkt: Any, result: PassiveSniffResult) -> None:
 
 
 def _handle_dhcp(pkt: Any, result: PassiveSniffResult) -> None:
-    """Extract DHCP hostname options (option 12) from DHCP requests."""
+    """DHCP: hostname (opt 12) from requests + server detection from OFFER/ACK."""
     if not pkt.haslayer(scapy.IP): return
     if not (pkt.haslayer(scapy.UDP) and pkt[scapy.UDP].dport in (67, 68)):
         return
     src_ip = pkt[scapy.IP].src
     try:
         raw = bytes(pkt[scapy.UDP].payload)
-        if len(raw) < 240: return
-        if raw[:4] != b"\x01\x01\x06\x00": return  # BOOTP request magic
-        # Skip to options (byte 236 onward, after magic cookie at 236)
-        if raw[236:240] != b"\x63\x82\x53\x63": return
+        if len(raw) < 240 or raw[236:240] != b"\x63\x82\x53\x63": return
+        op = raw[0]
+        msg_type = None
         i = 240
         while i < len(raw) - 1:
             opt = raw[i]; i += 1
@@ -1241,10 +1293,52 @@ def _handle_dhcp(pkt: Any, result: PassiveSniffResult) -> None:
             length = raw[i]; i += 1
             if i + length > len(raw): break
             data = raw[i:i + length]; i += length
-            if opt == 12:  # Hostname
+            if opt == 12 and op == 1:  # Hostname (in client requests)
                 hostname = data.decode("utf-8", errors="ignore").strip()
                 if hostname:
                     result.observe(src_ip, name=hostname, protocol="DHCP")
+            elif opt == 53 and length == 1:
+                msg_type = data[0]
+        # OFFER (2) / ACK (5) originate from a DHCP server.
+        if msg_type in (2, 5):
+            result.observe_dhcp_server(src_ip)
+    except Exception:
+        pass
+
+
+def _handle_conversation(pkt: Any, result: PassiveSniffResult) -> None:
+    if pkt.haslayer(scapy.IP):
+        try:
+            result.observe_conversation(pkt[scapy.IP].src, pkt[scapy.IP].dst)
+        except Exception:
+            pass
+
+
+def _handle_vlan(pkt: Any, result: PassiveSniffResult) -> None:
+    if pkt.haslayer(scapy.Dot1Q):
+        try:
+            result.observe_vlan(int(pkt[scapy.Dot1Q].vlan))
+        except Exception:
+            pass
+
+
+def _handle_osfp(pkt: Any, result: PassiveSniffResult) -> None:
+    """Passive OS guess from a SYN packet's initial TTL + TCP window size."""
+    if not (pkt.haslayer(scapy.IP) and pkt.haslayer(scapy.TCP)):
+        return
+    try:
+        tcp = pkt[scapy.TCP]
+        if tcp.flags & 0x02 and not (tcp.flags & 0x10):  # SYN, not SYN/ACK
+            ttl = int(pkt[scapy.IP].ttl)
+            win = int(tcp.window)
+            init_ttl = 64 if ttl <= 64 else 128 if ttl <= 128 else 255
+            table = {(64, 64240): "Linux", (64, 65535): "Linux/Android",
+                     (128, 65535): "Windows", (128, 8192): "Windows",
+                     (255, 4128): "Cisco/Network gear"}
+            guess = table.get((init_ttl, win)) or {64: "Linux/Unix",
+                    128: "Windows", 255: "Network gear"}.get(init_ttl)
+            if guess:
+                result.observe_osfp(pkt[scapy.IP].src, guess)
     except Exception:
         pass
 
@@ -2926,6 +3020,864 @@ def get_routes_and_gateway() -> Dict[str, Any]:
     return out
 
 
+# ── Wi-Fi / wireless uplink ─────────────────────────────────────────────────────
+#
+# Describes the wireless link between this machine and the router/AP it is
+# associated with: SSID, the AP's BSSID (radio MAC), RSSI / signal quality,
+# channel + band, negotiated PHY rates, and BSS-level beacon details. Used to
+# enrich the topology gateway node so you can see *which* AP you ride and how
+# strong the link is. Returns {"connected": False, ...} on wired-only hosts.
+
+_WIFI_SIGNAL_LABELS = (
+    (-50, "excellent"), (-60, "good"), (-67, "fair"), (-75, "weak"),
+)
+
+
+def _band_from_freq(mhz: Optional[int]) -> Optional[str]:
+    if not mhz:
+        return None
+    if 2400 <= mhz < 2500:
+        return "2.4 GHz"
+    if 4900 <= mhz < 5900:
+        return "5 GHz"
+    if 5925 <= mhz <= 7125:
+        return "6 GHz"
+    return None
+
+
+def _dbm_to_pct(dbm: Optional[int]) -> Optional[int]:
+    """Rough RSSI→quality mapping (-100 dBm ≈ 0 %, -50 dBm ≈ 100 %)."""
+    if dbm is None:
+        return None
+    return max(0, min(100, int(2 * (dbm + 100))))
+
+
+def _pct_to_dbm(pct: Optional[int]) -> Optional[int]:
+    if pct is None:
+        return None
+    return int(pct / 2 - 100)
+
+
+def _signal_label(dbm: Optional[int]) -> Optional[str]:
+    if dbm is None:
+        return None
+    for threshold, label in _WIFI_SIGNAL_LABELS:
+        if dbm >= threshold:
+            return label
+    return "very weak"
+
+
+def _wifi_finalize(info: Dict[str, Any]) -> Dict[str, Any]:
+    if info.get("signal_dbm") is None and info.get("signal_pct") is not None:
+        info["signal_dbm"] = _pct_to_dbm(info["signal_pct"])
+    if info.get("signal_pct") is None and info.get("signal_dbm") is not None:
+        info["signal_pct"] = _dbm_to_pct(info["signal_dbm"])
+    if info.get("band") is None:
+        info["band"] = _band_from_freq(info.get("frequency_mhz"))
+    if (info.get("snr_db") is None and info.get("signal_dbm") is not None
+            and info.get("noise_dbm") is not None):
+        info["snr_db"] = info["signal_dbm"] - info["noise_dbm"]
+    info["signal_quality"] = _signal_label(info.get("signal_dbm"))
+    return info
+
+
+def _wifi_linux() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"connected": False}
+    raw: Dict[str, Any] = {}
+    iface: Optional[str] = None
+    if which("iw"):
+        dev = safe_run(["iw", "dev"], timeout=6)
+        raw["iw_dev"] = dev.get("stdout")
+        for line in (dev.get("stdout") or "").splitlines():
+            m = re.search(r"^\s*Interface\s+(\S+)", line)
+            if m:
+                iface = m.group(1)
+                break
+    if iface and which("iw"):
+        info["interface"] = iface
+        link = safe_run(["iw", "dev", iface, "link"], timeout=6)
+        out = link.get("stdout") or ""
+        raw["iw_link"] = out
+        if out.strip() and "Not connected" not in out:
+            info["connected"] = True
+            patterns = {
+                "bssid": (r"Connected to ([0-9a-f:]{17})", str),
+                "ssid": (r"\bSSID:\s*(.+)", str),
+                "frequency_mhz": (r"\bfreq:\s*(\d+)", int),
+                "signal_dbm": (r"\bsignal:\s*(-?\d+)\s*dBm", int),
+                "tx_rate_mbps": (r"tx bitrate:\s*([\d.]+)\s*MBit/s", float),
+                "rx_rate_mbps": (r"rx bitrate:\s*([\d.]+)\s*MBit/s", float),
+                "beacon_interval": (r"beacon int:\s*(\d+)", int),
+                "dtim_period": (r"dtim period:\s*(\d+)", int),
+            }
+            for key, (pat, cast) in patterns.items():
+                m = re.search(pat, out, re.I)
+                if m:
+                    val = m.group(1).strip()
+                    info[key] = cast(val) if cast is not str else val
+            if info.get("bssid"):
+                info["bssid"] = info["bssid"].lower()
+            m = re.search(r"bss flags:\s*(.+)", out, re.I)
+            if m:
+                info["bss_flags"] = m.group(1).strip()
+        st = safe_run(["iw", "dev", iface, "info"], timeout=6)
+        raw["iw_info"] = st.get("stdout")
+        m = re.search(r"channel\s+(\d+).*?width:\s*(\d+)\s*MHz",
+                      st.get("stdout") or "", re.I | re.S)
+        if m:
+            info["channel"] = int(m.group(1))
+            info["channel_width_mhz"] = int(m.group(2))
+        m = re.search(r"txpower\s+([\d.]+)\s*dBm", st.get("stdout") or "", re.I)
+        if m:
+            info["tx_power_dbm"] = float(m.group(1))
+    if which("nmcli"):
+        nm = safe_run(["nmcli", "-t", "-f",
+                       "IN-USE,SSID,BSSID,CHAN,FREQ,SIGNAL,RATE,SECURITY",
+                       "device", "wifi"], timeout=8)
+        raw["nmcli"] = nm.get("stdout")
+        for line in (nm.get("stdout") or "").splitlines():
+            if not line.startswith("*"):
+                continue
+            parts = re.split(r"(?<!\\):", line)
+            parts = [p.replace("\\:", ":") for p in parts]
+            if len(parts) >= 8:
+                info["connected"] = True
+                info.setdefault("ssid", parts[1] or None)
+                info.setdefault("bssid", (parts[2] or "").lower() or None)
+                if parts[3].isdigit():
+                    info.setdefault("channel", int(parts[3]))
+                fm = re.search(r"(\d+)", parts[4])
+                if fm:
+                    info.setdefault("frequency_mhz", int(fm.group(1)))
+                if parts[5].isdigit():
+                    info.setdefault("signal_pct", int(parts[5]))
+                info.setdefault("tx_rate", parts[6] or None)
+                info["security"] = parts[7] or "Open"
+            break
+    info["raw"] = raw
+    return info
+
+
+def _wifi_macos() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"connected": False}
+    raw: Dict[str, Any] = {}
+    airport = ("/System/Library/PrivateFrameworks/Apple80211.framework/"
+               "Versions/Current/Resources/airport")
+    a = safe_run([airport, "-I"], timeout=8)
+    out = a.get("stdout") or ""
+    raw["airport_I"] = out
+    fields = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            fields[k.strip().lower()] = v.strip()
+    if fields.get("ssid") or fields.get("bssid"):
+        info["connected"] = True
+        info["ssid"] = fields.get("ssid")
+        info["bssid"] = (fields.get("bssid") or "").lower() or None
+        for src, dst, cast in (("agrctlrssi", "signal_dbm", int),
+                               ("agrctlnoise", "noise_dbm", int),
+                               ("lasttxrate", "tx_rate_mbps", float),
+                               ("maxrate", "max_rate_mbps", float)):
+            try:
+                if fields.get(src) not in (None, ""):
+                    info[dst] = cast(fields[src])
+            except ValueError:
+                pass
+        ch = fields.get("channel", "")
+        cm = re.match(r"(\d+)(?:,(\d+))?", ch)
+        if cm:
+            info["channel"] = int(cm.group(1))
+            if cm.group(2):
+                info["channel_width_mhz"] = int(cm.group(2))
+        info["phy_mode"] = fields.get("phymode") or fields.get("802.11 auth")
+        info["security"] = fields.get("link auth")
+    info["raw"] = raw
+    return info
+
+
+def _wifi_windows() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"connected": False}
+    raw: Dict[str, Any] = {}
+    w = safe_run(["netsh", "wlan", "show", "interfaces"], timeout=10)
+    out = w.get("stdout") or ""
+    raw["netsh"] = out
+    fields = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            fields[k.strip().lower()] = v.strip()
+    if fields.get("state", "").lower() == "connected" or fields.get("bssid"):
+        info["connected"] = True
+        info["interface"] = fields.get("name")
+        info["ssid"] = fields.get("ssid")
+        info["bssid"] = (fields.get("bssid") or "").lower() or None
+        info["phy_mode"] = fields.get("radio type")
+        info["security"] = fields.get("authentication")
+        info["band"] = fields.get("band") or None
+        for src, dst, cast in (("channel", "channel", int),
+                               ("receive rate (mbps)", "rx_rate_mbps", float),
+                               ("transmit rate (mbps)", "tx_rate_mbps", float)):
+            try:
+                if fields.get(src):
+                    info[dst] = cast(fields[src])
+            except ValueError:
+                pass
+        sm = re.search(r"(\d+)", fields.get("signal", ""))
+        if sm:
+            info["signal_pct"] = int(sm.group(1))
+    info["raw"] = raw
+    return info
+
+
+def get_wifi_info() -> Dict[str, Any]:
+    """Describe the wireless uplink to the connected router/AP (if any)."""
+    try:
+        if is_windows():
+            info = _wifi_windows()
+        elif is_macos():
+            info = _wifi_macos()
+        elif is_linux():
+            info = _wifi_linux()
+        else:
+            info = {"connected": False, "error": "unsupported platform"}
+    except Exception as e:
+        return {"connected": False, "error": repr(e)}
+    return _wifi_finalize(info)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Wireless survey · L2 (LLDP/CDP) · path · link quality · anomalies · WAN · BT · EOL
+# (v6.1 expansion — action-packed recon to feed the topology map)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CLEAN_24 = (1, 6, 11)
+_WEAK_SEC_RE = re.compile(r"\b(open|wep|wpa(?!2|3))\b", re.I)
+
+
+def get_wifi_survey(oui_map: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    """Survey nearby APs (BSSID/SSID/signal/channel/security)."""
+    oui_map = oui_map or {}
+    aps: Dict[str, Dict[str, Any]] = {}
+    try:
+        if is_windows():
+            raw = safe_run(["netsh", "wlan", "show", "networks", "mode=bssid"], timeout=15)
+            ssid = auth = None
+            cur = None
+            for line in (raw.get("stdout") or "").splitlines():
+                s = line.strip()
+                m = re.match(r"SSID\s+\d+\s*:\s*(.*)", s)
+                if m: ssid = m.group(1).strip() or None; continue
+                m = re.match(r"Authentication\s*:\s*(.+)", s)
+                if m: auth = m.group(1).strip(); continue
+                m = re.match(r"BSSID\s+\d+\s*:\s*([0-9a-fA-F:]{17})", s)
+                if m:
+                    cur = {"bssid": m.group(1).lower(), "ssid": ssid,
+                           "security": auth, "wps": None}
+                    aps[cur["bssid"]] = cur; continue
+                if cur is not None:
+                    m = re.match(r"Signal\s*:\s*(\d+)%", s)
+                    if m: cur["signal_pct"] = int(m.group(1))
+                    m = re.match(r"Channel\s*:\s*(\d+)", s)
+                    if m: cur["channel"] = int(m.group(1))
+        elif is_macos():
+            airport = ("/System/Library/PrivateFrameworks/Apple80211.framework/"
+                       "Versions/Current/Resources/airport")
+            raw = safe_run([airport, "-s"], timeout=12)
+            for line in (raw.get("stdout") or "").splitlines()[1:]:
+                m = re.search(r"^(.*?)\s+([0-9a-fA-F:]{17})\s+(-?\d+)\s+(\d+)", line.strip())
+                if m:
+                    b = m.group(2).lower()
+                    aps[b] = {"ssid": m.group(1).strip() or None, "bssid": b,
+                              "signal_dbm": int(m.group(3)), "channel": int(m.group(4)),
+                              "security": None, "wps": None}
+        elif is_linux():
+            if which("nmcli"):
+                nm = safe_run(["nmcli", "-t", "-f",
+                               "BSSID,SSID,CHAN,FREQ,SIGNAL,SECURITY", "device", "wifi"],
+                              timeout=12)
+                for line in (nm.get("stdout") or "").splitlines():
+                    parts = [p.replace("\\:", ":") for p in re.split(r"(?<!\\):", line)]
+                    if len(parts) < 6: continue
+                    b = (parts[0] or "").lower()
+                    if not re.match(r"^[0-9a-f:]{17}$", b): continue
+                    fm = re.search(r"(\d+)", parts[3])
+                    aps[b] = {"bssid": b, "ssid": parts[1] or None,
+                              "channel": int(parts[2]) if parts[2].isdigit() else None,
+                              "frequency_mhz": int(fm.group(1)) if fm else None,
+                              "signal_pct": int(parts[4]) if parts[4].isdigit() else None,
+                              "security": parts[5] or "Open", "wps": None}
+            if is_root() and which("iw"):
+                dev = safe_run(["iw", "dev"], timeout=6)
+                iface = None
+                for line in (dev.get("stdout") or "").splitlines():
+                    m = re.search(r"^\s*Interface\s+(\S+)", line)
+                    if m: iface = m.group(1); break
+                if iface:
+                    sc = safe_run(["iw", "dev", iface, "scan"], timeout=20)
+                    cur = None
+                    for line in (sc.get("stdout") or "").splitlines():
+                        bm = re.match(r"BSS ([0-9a-f:]{17})", line.strip(), re.I)
+                        if bm: cur = bm.group(1).lower(); aps.setdefault(cur, {"bssid": cur}); continue
+                        if not cur: continue
+                        sm = re.search(r"signal:\s*(-?[\d.]+)\s*dBm", line)
+                        if sm: aps[cur]["signal_dbm"] = int(float(sm.group(1)))
+                        if "WPS:" in line: aps[cur]["wps"] = True
+    except Exception:
+        pass
+    out = []
+    for a in aps.values():
+        if not a.get("bssid"): continue
+        if a.get("signal_dbm") is None and a.get("signal_pct") is not None:
+            a["signal_dbm"] = _pct_to_dbm(a["signal_pct"])
+        if a.get("signal_pct") is None and a.get("signal_dbm") is not None:
+            a["signal_pct"] = _dbm_to_pct(a["signal_dbm"])
+        if a.get("band") is None:
+            a["band"] = _band_from_freq(a.get("frequency_mhz"))
+        a["signal_quality"] = _signal_label(a.get("signal_dbm"))
+        oui = mac_to_oui(a["bssid"])
+        a["vendor"] = oui_map.get(oui) if oui else None
+        out.append(a)
+    out.sort(key=lambda a: a.get("signal_dbm") if a.get("signal_dbm") is not None else -999,
+             reverse=True)
+    return out
+
+
+def analyze_wifi_survey(aps: List[Dict[str, Any]],
+                        connected: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    connected = connected or {}
+    conn_ssid = connected.get("ssid")
+    conn_bssid = (connected.get("bssid") or "").lower() or None
+    load24: Dict[int, int] = {}
+    for a in aps:
+        if a.get("band") == "2.4 GHz" and a.get("channel"):
+            load24[a["channel"]] = load24.get(a["channel"], 0) + 1
+    best_24 = min(_CLEAN_24, key=lambda c: load24.get(c, 0)) if load24 else None
+    rogue, findings = [], []
+    if conn_ssid:
+        rogue = [a for a in aps if a.get("ssid") == conn_ssid
+                 and a.get("bssid") and a["bssid"] != conn_bssid]
+        if rogue:
+            findings.append(f"Possible evil-twin: SSID '{conn_ssid}' also on "
+                            + ", ".join(a["bssid"] for a in rogue))
+    if any(a.get("wps") for a in aps):
+        findings.append("WPS enabled on nearby AP(s) — brute-forceable.")
+    for a in aps:
+        if a.get("ssid") == conn_ssid and _WEAK_SEC_RE.search(a.get("security") or ""):
+            findings.append(f"Weak Wi-Fi security on your network ({a.get('security')}).")
+            break
+    return {"ap_count": len(aps), "recommended_channel_24ghz": best_24,
+            "rogue_aps": rogue, "findings": findings}
+
+
+# ── LLDP / CDP passive listener (scapy) ───────────────────────────────────────
+
+def _lldp_decode_id(val: bytes) -> str:
+    subtype = val[0]; body = val[1:]
+    if subtype in (4, 3) and len(body) == 6:
+        return ":".join(f"{x:02x}" for x in body)
+    return body.decode("utf-8", "ignore").strip("\x00")
+
+
+def _parse_lldp(payload: bytes) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"protocol": "LLDP"}
+    i, n = 0, len(payload)
+    while i + 2 <= n:
+        header = struct.unpack("!H", payload[i:i + 2])[0]
+        ttype, tlen = header >> 9, header & 0x1FF
+        i += 2; val = payload[i:i + tlen]; i += tlen
+        if ttype == 0: break
+        if ttype == 1 and len(val) > 1: out["chassis_id"] = _lldp_decode_id(val)
+        elif ttype == 2 and len(val) > 1: out["port_id"] = _lldp_decode_id(val)
+        elif ttype == 5: out["system_name"] = val.decode("utf-8", "ignore").strip("\x00")
+        elif ttype == 6: out["system_desc"] = val.decode("utf-8", "ignore").strip("\x00")[:200]
+        elif ttype == 8 and len(val) >= 7:
+            alen = val[0]
+            if val[1] == 1 and alen == 5:
+                out["mgmt_addr"] = ".".join(str(x) for x in val[2:6])
+        elif ttype == 127 and len(val) >= 6 and val[:3] == b"\x00\x80\xc2" and val[3] == 1:
+            out["vlan"] = struct.unpack("!H", val[4:6])[0]
+    return out
+
+
+def _parse_cdp(payload: bytes) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"protocol": "CDP"}
+    if len(payload) < 4: return out
+    i, n = 4, len(payload)
+    while i + 4 <= n:
+        ttype, tlen = struct.unpack("!HH", payload[i:i + 4])
+        if tlen < 4 or i + tlen > n: break
+        val = payload[i + 4:i + tlen]
+        if ttype == 0x0001: out["system_name"] = val.decode("utf-8", "ignore").strip("\x00")
+        elif ttype == 0x0003: out["port_id"] = val.decode("utf-8", "ignore").strip("\x00")
+        elif ttype == 0x0006: out["platform"] = val.decode("utf-8", "ignore").strip("\x00")[:120]
+        elif ttype == 0x000a and len(val) >= 2: out["vlan"] = struct.unpack("!H", val[:2])[0]
+        i += tlen
+    return out
+
+
+def lldp_cdp_listen(duration_s: float = 35.0,
+                    interface: Optional[str] = None) -> List[Dict[str, Any]]:
+    if not _HAS_SCAPY or not is_root():
+        return []
+    found: Dict[str, Dict[str, Any]] = {}
+
+    def handle(pkt: Any) -> None:
+        try:
+            raw = bytes(pkt)
+            if len(raw) < 15: return
+            dst = ":".join(f"{x:02x}" for x in raw[0:6])
+            src = ":".join(f"{x:02x}" for x in raw[6:12])
+            et = struct.unpack("!H", raw[12:14])[0]
+            if et == 0x88CC:
+                info = _parse_lldp(raw[14:])
+            elif dst == "01:00:0c:cc:cc:cc":
+                idx = raw.find(b"\xaa\xaa\x03\x00\x00\x0c\x20\x00", 14)
+                if idx < 0: return
+                info = _parse_cdp(raw[idx + 8:])
+            else:
+                return
+            info["source_mac"] = src
+            if len(info) > 2:
+                key = info.get("chassis_id") or info.get("system_name") or src
+                found[key] = {**found.get(key, {}), **info}
+        except Exception:
+            pass
+
+    try:
+        kwargs = {"iface": interface} if interface else {}
+        scapy.sniff(prn=handle, timeout=duration_s, store=False,
+                    filter="ether proto 0x88cc or ether dst 01:00:0c:cc:cc:cc", **kwargs)
+    except Exception:
+        pass
+    return list(found.values())
+
+
+# ── Traceroute / path ─────────────────────────────────────────────────────────
+
+def _trace_parse(text: str) -> List[Dict[str, Any]]:
+    hops = []
+    for line in text.splitlines():
+        s = line.strip()
+        hm = re.match(r"^(\d+)\b", s)
+        if not hm: continue
+        rest = s[hm.end():]
+        ip_m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", rest)
+        ip = ip_m.group(1) if ip_m else None
+        lat = re.search(r"([\d.]+)\s*ms", rest)
+        hops.append({"hop": int(hm.group(1)), "ip": ip,
+                     "rtt_ms": float(lat.group(1)) if lat else None,
+                     "timeout": ip is None and "*" in rest,
+                     "private": bool(ip and is_private_or_lan_ip(ip))})
+    return hops
+
+
+def trace_path(gateway: Optional[str], internet_host: str = "8.8.8.8") -> Dict[str, Any]:
+    if is_windows():
+        tool = ["tracert", "-d", "-w", "800", "-h", "20"] if which("tracert") else None
+    elif which("traceroute"):
+        tool = ["traceroute", "-n", "-w", "1", "-q", "1", "-m", "20"]
+    else:
+        tool = None
+    if not tool:
+        return {"hops": [], "error": "no traceroute/tracert binary"}
+    res = safe_run(tool + [internet_host], timeout=40)
+    hops = _trace_parse(res.get("stdout", ""))
+    lead = 0
+    for h in hops:
+        if h.get("ip") and h["private"]: lead += 1
+        elif h.get("ip"): break
+    first_public = next((h["ip"] for h in hops if h.get("ip") and not h["private"]), None)
+    return {"internet": {"hops": hops},
+            "hop_count": len([h for h in hops if h.get("ip")]),
+            "private_hops_before_public": lead, "double_nat": lead >= 2,
+            "isp_edge_ip": first_public}
+
+
+# ── Link quality ──────────────────────────────────────────────────────────────
+
+def measure_link_quality(gateway: Optional[str], internet_ip: str = "1.1.1.1",
+                         count: int = 10) -> Dict[str, Any]:
+    def one(ip: str) -> Dict[str, Any]:
+        cmd = (["ping", "-n", str(count), "-w", "1000", ip] if is_windows()
+               else ["ping", "-c", str(count), "-W", "1", ip])
+        out = safe_run(cmd, timeout=count * 2 + 10).get("stdout", "") or ""
+        rtts = [float(m) for m in re.findall(r"time[=<]\s*([\d.]+)\s*ms", out, re.I)]
+        recv = len(rtts)
+        d = {"ip": ip, "sent": count, "received": recv,
+             "loss_pct": round((count - recv) / count * 100, 1) if count else 100.0,
+             "reachable": recv > 0}
+        if rtts:
+            diffs = [abs(rtts[i] - rtts[i - 1]) for i in range(1, len(rtts))]
+            d.update({"min_ms": round(min(rtts), 2), "avg_ms": round(sum(rtts) / len(rtts), 2),
+                      "max_ms": round(max(rtts), 2),
+                      "jitter_ms": round(sum(diffs) / len(diffs), 2) if diffs else 0.0})
+        return d
+    out = {}
+    if gateway: out["gateway"] = one(gateway)
+    out["internet"] = one(internet_ip)
+    return out
+
+
+# ── Anomalies (ARP spoof / rogue DHCP) ────────────────────────────────────────
+
+def analyze_anomalies(neighbors: Dict[str, Any], gateway: Optional[str],
+                      dhcp_servers: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    findings = []
+    mac_to_ips: Dict[str, set] = {}
+    gw_mac = None
+    for n in neighbors.get("neighbors", []):
+        mac = (n.get("mac") or "").lower(); ip = n.get("ip")
+        if not mac or not ip: continue
+        mac_to_ips.setdefault(mac, set()).add(ip)
+        if ip == gateway: gw_mac = mac
+    for mac, ips in mac_to_ips.items():
+        if mac in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"): continue
+        ipv4s = {ip for ip in ips if ":" not in ip}
+        if len(ipv4s) > 1:
+            sev = "high" if gateway in ipv4s else "medium"
+            findings.append({"severity": sev, "title": "One MAC claims multiple IPs",
+                             "detail": f"MAC {mac} → {sorted(ipv4s)} (ARP poisoning signature)."})
+    if gw_mac:
+        others = sorted(ip for ip in mac_to_ips.get(gw_mac, set())
+                        if ip != gateway and ":" not in ip)
+        if others:
+            findings.append({"severity": "high", "title": "Gateway MAC shared with another host",
+                             "detail": f"Gateway {gateway} and {others} share {gw_mac} — MITM indicator."})
+    if dhcp_servers and len(dhcp_servers) > 1:
+        findings.append({"severity": "high", "title": "Multiple DHCP servers",
+                         "detail": f"DHCP offers from {dhcp_servers} — possible rogue DHCP."})
+    return findings
+
+
+# ── WAN exposure (UPnP IGD) ───────────────────────────────────────────────────
+
+def assess_wan_exposure() -> Dict[str, Any]:
+    import socket as _socket
+    from urllib.parse import urljoin
+    from urllib.request import Request, urlopen
+    out = {"igd_found": False, "external_ip": None, "port_mappings": [], "findings": []}
+    targets = ["urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+               "urn:schemas-upnp-org:service:WANIPConnection:1",
+               "urn:schemas-upnp-org:service:WANPPPConnection:1"]
+    locations: List[str] = []
+    for st in targets:
+        msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+               'MAN: "ssdp:discover"\r\nMX: 2\r\n' f"ST: {st}\r\n\r\n").encode()
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.settimeout(3.0)
+        try:
+            s.sendto(msg, ("239.255.255.250", 1900))
+            while True:
+                try: data, _ = s.recvfrom(2048)
+                except _socket.timeout: break
+                m = re.search(rb"LOCATION:\s*(\S+)", data, re.I)
+                if m:
+                    loc = m.group(1).decode("ascii", "ignore").strip()
+                    if loc not in locations: locations.append(loc)
+        except Exception: pass
+        finally: s.close()
+
+    def http_get(url):
+        try:
+            with urlopen(Request(url, headers={"User-Agent": "OmniRecon/6"}), timeout=4) as r:
+                return r.read(65536).decode("utf-8", "ignore")
+        except Exception: return None
+
+    def soap(curl, stype, action, args=""):
+        env = ('<?xml version="1.0"?><s:Envelope '
+               'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+               's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+               f'<s:Body><u:{action} xmlns:u="{stype}">{args}</u:{action}>'
+               '</s:Body></s:Envelope>').encode()
+        try:
+            req = Request(curl, data=env, headers={
+                "Content-Type": 'text/xml; charset="utf-8"',
+                "SOAPAction": f'"{stype}#{action}"', "User-Agent": "OmniRecon/6"})
+            with urlopen(req, timeout=4) as r:
+                return r.read(65536).decode("utf-8", "ignore")
+        except Exception: return None
+
+    def tag(xml, name):
+        if not xml: return None
+        m = re.search(rf"<{name}>(.*?)</{name}>", xml, re.S | re.I)
+        return m.group(1).strip() if m else None
+
+    for loc in locations:
+        xml = http_get(loc)
+        if not xml: continue
+        svc = None
+        for stype in ("WANIPConnection", "WANPPPConnection"):
+            for block in re.findall(r"<service>(.*?)</service>", xml, re.S | re.I):
+                if stype in block:
+                    stx = re.search(r"<serviceType>(.*?)</serviceType>", block, re.S | re.I)
+                    cu = re.search(r"<controlURL>(.*?)</controlURL>", block, re.S | re.I)
+                    if stx and cu:
+                        svc = {"service_type": stx.group(1).strip(),
+                               "control_url": urljoin(loc, cu.group(1).strip())}
+                        break
+            if svc: break
+        if not svc: continue
+        out["igd_found"] = True
+        ext = soap(svc["control_url"], svc["service_type"], "GetExternalIPAddress")
+        out["external_ip"] = tag(ext, "NewExternalIPAddress")
+        for i in range(64):
+            resp = soap(svc["control_url"], svc["service_type"],
+                        "GetGenericPortMappingEntry",
+                        f"<NewPortMappingIndex>{i}</NewPortMappingIndex>")
+            if not resp or "GetGenericPortMappingEntryResponse" not in resp: break
+            out["port_mappings"].append({
+                "external_port": tag(resp, "NewExternalPort"),
+                "protocol": tag(resp, "NewProtocol"),
+                "internal_client": tag(resp, "NewInternalClient"),
+                "internal_port": tag(resp, "NewInternalPort"),
+                "description": tag(resp, "NewPortMappingDescription"),
+                "enabled": tag(resp, "NewEnabled")})
+        break
+    if out["igd_found"]:
+        out["findings"].append({"severity": "medium", "title": "UPnP IGD open to the LAN",
+                                "detail": "Any LAN device can open inbound ports via UPnP."})
+        if out["port_mappings"]:
+            out["findings"].append({"severity": "high",
+                                    "title": f"{len(out['port_mappings'])} port(s) forwarded to WAN",
+                                    "detail": "Review router port forwards."})
+    return out
+
+
+# ── Bluetooth / BLE ───────────────────────────────────────────────────────────
+
+def scan_bluetooth(duration_s: float = 8.0,
+                   oui_map: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    oui_map = oui_map or {}
+    try:
+        if is_linux() and which("bluetoothctl"):
+            safe_run(["bluetoothctl", "--timeout", str(int(duration_s)), "scan", "on"],
+                     timeout=int(duration_s) + 10)
+            res = safe_run(["bluetoothctl", "devices"], timeout=10)
+            devs = []
+            for line in (res.get("stdout") or "").splitlines():
+                m = re.match(r"Device\s+([0-9A-F:]{17})\s+(.*)", line.strip(), re.I)
+                if m:
+                    mac = m.group(1).lower(); name = m.group(2).strip()
+                    oui = mac_to_oui(mac)
+                    devs.append({"address": mac,
+                                 "name": None if name == mac.upper() else name,
+                                 "vendor": oui_map.get(oui) if oui else None})
+            return {"available": True, "devices": devs, "count": len(devs)}
+        if is_macos():
+            res = safe_run(["system_profiler", "SPBluetoothDataType"], timeout=20)
+            devs = []
+            for blk in re.split(r"\n(?=\s{4}\S.*:\n)", res.get("stdout") or ""):
+                addr = re.search(r"Address:\s*([0-9A-Fa-f:\-]{17})", blk)
+                name_m = re.match(r"\s*(.+?):", blk)
+                if addr:
+                    devs.append({"address": addr.group(1).lower().replace("-", ":"),
+                                 "name": name_m.group(1).strip() if name_m else None,
+                                 "connected": "Connected: Yes" in blk})
+            return {"available": True, "devices": devs, "count": len(devs)}
+    except Exception as e:
+        return {"available": True, "reason": repr(e), "devices": []}
+    return {"available": False, "reason": "unsupported platform", "devices": []}
+
+
+# ── Software lifecycle (endoflife.date) ───────────────────────────────────────
+
+_EOL_PRODUCT_MAP = {"apache": "apache", "httpd": "apache", "nginx": "nginx",
+                    "openssh": "openssh", "php": "php", "mysql": "mysql",
+                    "mariadb": "mariadb", "postgresql": "postgresql",
+                    "openssl": "openssl", "lighttpd": "lighttpd", "samba": "samba"}
+_EOL_VER_RE = re.compile(r"([A-Za-z][A-Za-z0-9+_-]*?)[/_ ]v?(\d+\.\d+(?:\.\d+)?)", re.I)
+
+
+def extract_eol_products(text: str) -> List[Tuple[str, str]]:
+    out = []
+    for m in _EOL_VER_RE.finditer(text or ""):
+        slug = _EOL_PRODUCT_MAP.get(m.group(1).lower())
+        if slug: out.append((slug, m.group(2)))
+    return out
+
+
+def check_lifecycle(hosts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    cache: Dict[str, Any] = {}
+    by_host: Dict[str, List[Dict[str, Any]]] = {}
+    findings = []
+
+    def fetch(slug):
+        if slug in cache: return cache[slug]
+        try:
+            r = requests.get(f"https://endoflife.date/api/{slug}.json",
+                             timeout=6, headers={"User-Agent": "OmniRecon/6"})
+            cache[slug] = r.json() if r.status_code == 200 else None
+        except Exception:
+            cache[slug] = None
+        return cache[slug]
+
+    for h in hosts:
+        ip = h.get("ip"); texts = []
+        for hint in (h.get("service_hints") or {}).values():
+            if isinstance(hint, dict):
+                for k in ("banner", "server", "http_server", "http_title"):
+                    if isinstance(hint.get(k), str): texts.append(hint[k])
+            elif isinstance(hint, str):
+                texts.append(hint)
+        seen = set()
+        for text in texts:
+            for slug, ver in extract_eol_products(text):
+                if (slug, ver) in seen: continue
+                seen.add((slug, ver))
+                cycles = fetch(slug)
+                if not isinstance(cycles, list): continue
+                parts = ver.split(".")
+                cyc = None
+                for cand in (".".join(parts[:2]), parts[0]):
+                    cyc = next((c for c in cycles if str(c.get("cycle")) == cand), None)
+                    if cyc: break
+                if not cyc: continue
+                eolv = cyc.get("eol")
+                is_eol = None
+                if isinstance(eolv, bool): is_eol = eolv
+                elif isinstance(eolv, str):
+                    try: is_eol = dt.date.fromisoformat(eolv) < dt.date.today()
+                    except ValueError: pass
+                by_host.setdefault(ip, []).append(
+                    {"product": slug, "version": ver, "cycle": cyc.get("cycle"),
+                     "eol": eolv, "is_eol": is_eol, "latest": cyc.get("latest")})
+                if is_eol:
+                    findings.append({"severity": "high", "ip": ip,
+                                     "title": f"End-of-life: {slug} {ver}",
+                                     "detail": f"{slug} {ver} past EOL ({eolv})."})
+    return {"by_host": by_host, "findings": findings}
+
+
+# ── Router / gateway security audit ───────────────────────────────────────────
+
+_ROUTER_DEFAULT_CREDS = [("admin", "admin"), ("admin", "password"), ("admin", ""),
+                         ("admin", "1234"), ("root", "root"), ("user", "user")]
+
+
+def build_router_audit(report: Dict[str, Any], authorized: bool = False) -> Dict[str, Any]:
+    gateway = report.get("routes", {}).get("default_gateway")
+    out: Dict[str, Any] = {"gateway": gateway, "admin": None,
+                           "default_creds": [], "findings": [], "authorized": authorized}
+    if not gateway:
+        return out
+
+    def get(url, auth=None):
+        try:
+            r = requests.get(url, timeout=4, verify=False, auth=auth,
+                             headers={"User-Agent": "OmniRecon/6"})
+            return r.status_code, dict(r.headers), r.text[:4096]
+        except Exception:
+            return None
+
+    admin = None
+    hosts = report.get("discovery", {}).get("hosts", [])
+    gw_host = next((h for h in hosts if h.get("ip") == gateway), {})
+    open_ports = gw_host.get("open_ports", []) if isinstance(gw_host, dict) else []
+    for port in [p for p in (80, 443, 8080, 8443, 8000) if not open_ports or p in open_ports] \
+            or [80, 443, 8080, 8443, 8000]:
+        scheme = "https" if port in (443, 8443) else "http"
+        res = get(f"{scheme}://{gateway}:{port}/")
+        if res:
+            status, headers, body = res
+            m = re.search(r"<title>(.*?)</title>", body or "", re.I | re.S)
+            wa = headers.get("WWW-Authenticate") or headers.get("www-authenticate") or ""
+            admin = {"url": f"{scheme}://{gateway}:{port}/", "status": status,
+                     "server": headers.get("Server"),
+                     "title": m.group(1).strip()[:120] if m else None,
+                     "realm": wa or None, "basic_auth": "basic" in wa.lower()}
+            break
+    out["admin"] = admin
+    if admin:
+        out["findings"].append({"severity": "info", "title": "Router admin interface reachable",
+                                "detail": f"Admin UI at {admin['url']} (server {admin.get('server') or '?'})."})
+        if admin["url"].startswith("http://"):
+            out["findings"].append({"severity": "medium", "title": "Router admin over plaintext HTTP",
+                                    "detail": f"{admin['url']} has no TLS."})
+        if authorized and admin.get("basic_auth"):
+            for user, pw in _ROUTER_DEFAULT_CREDS:
+                res = get(admin["url"], auth=(user, pw))
+                if res and 200 <= res[0] < 300:
+                    out["default_creds"].append((user, pw))
+            if out["default_creds"]:
+                creds = ", ".join(f"{u}/{p or '<blank>'}" for u, p in out["default_creds"])
+                out["findings"].append({"severity": "high",
+                                        "title": "Default credentials accepted on router",
+                                        "detail": f"{admin['url']} accepted: {creds}."})
+    wan = report.get("wan_exposure") or {}
+    if wan.get("igd_found"):
+        out["findings"].append({"severity": "medium", "title": "Router exposes UPnP IGD",
+                                "detail": "Any LAN device can open WAN ports via UPnP."})
+    banner = (admin or {}).get("server") or (gw_host.get("vendor") if isinstance(gw_host, dict) else "") or ""
+    if re.search(r"\d+\.\d+", banner):
+        out["firmware_banner"] = banner
+        out["findings"].append({"severity": "info", "title": "Router firmware/version exposed",
+                                "detail": f"Gateway advertises '{banner}' — cross-check CVEs."})
+    return out
+
+
+# ── Trends over time (topology time-lapse + signal trend) ─────────────────────
+
+def trends_from_reports(reports: List[Dict[str, Any]]) -> Dict[str, Any]:
+    snaps = []
+    for r in reports:
+        hosts = (r.get("discovery") or {}).get("hosts", [])
+        wifi = r.get("wifi") or {}
+        snaps.append({"stamp": (r.get("system") or {}).get("timestamp_local", ""),
+                      "host_ips": sorted(h.get("ip") for h in hosts if h.get("ip")),
+                      "signal_dbm": wifi.get("signal_dbm")})
+    # topology timeline
+    stamps = [s["stamp"] for s in snaps]
+    total = len(snaps)
+    seen: Dict[str, List[int]] = {}
+    for idx, s in enumerate(snaps):
+        for ip in s["host_ips"]:
+            seen.setdefault(ip, []).append(idx)
+    last = total - 1
+    prev_ips = set(snaps[last - 1]["host_ips"]) if total > 1 else set()
+    last_ips = set(snaps[last]["host_ips"]) if total else set()
+    nodes = []
+    for ip, idxs in sorted(seen.items()):
+        present_now = last in idxs
+        status = ("new" if len(idxs) == 1 and idxs[0] == last else
+                  "left" if not present_now else
+                  "stable" if len(idxs) == total else "intermittent")
+        nodes.append({"ip": ip, "first_seen": stamps[idxs[0]], "count": len(idxs),
+                      "frequency": round(len(idxs) / total, 2) if total else 0,
+                      "status": status})
+    timeline = {"snapshots": stamps, "nodes": nodes,
+                "added_last": sorted(last_ips - prev_ips) if total > 1 else sorted(last_ips),
+                "removed_last": sorted(prev_ips - last_ips) if total > 1 else []}
+    # signal trend
+    series = [{"stamp": s["stamp"], "signal_dbm": s["signal_dbm"]}
+              for s in snaps if s["signal_dbm"] is not None]
+    if len(series) >= 2:
+        delta = series[-1]["signal_dbm"] - series[0]["signal_dbm"]
+        trend = "degraded" if delta <= -5 else "improved" if delta >= 5 else "stable"
+        sig = {"series": series, "samples": len(series), "baseline_dbm": series[0]["signal_dbm"],
+               "latest_dbm": series[-1]["signal_dbm"], "delta_db": delta, "trend": trend}
+    else:
+        sig = {"series": series, "samples": len(series), "delta_db": None,
+               "trend": "insufficient data"}
+    return {"topology_timeline": timeline, "signal_trend": sig, "scan_count": total}
+
+
+def load_prior_reports(outdir: str, limit: int = 12) -> List[Dict[str, Any]]:
+    out = []
+    try:
+        files = sorted(f for f in os.listdir(outdir)
+                       if f.startswith("network_report_") and f.endswith(".json"))
+        for fname in files[-limit:]:
+            try:
+                with open(os.path.join(outdir, fname), "r", encoding="utf-8") as f:
+                    out.append(json.load(f))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
 def get_dns_config() -> Dict[str, Any]:
     out: Dict[str, Any] = {"dns_servers": [], "raw": None}
     try:
@@ -3813,6 +4765,9 @@ h2{font-size:1.05rem;font-weight:700;margin-bottom:12px}
 .info-table td{padding:6px 10px;border-bottom:1px solid #f1f5f9}
 .info-table td:first-child{font-weight:600;color:var(--muted);
   font-size:0.8rem;width:200px;white-space:nowrap}
+.info-card{flex:1;min-width:300px;background:var(--card,#fff);
+  border:1px solid var(--border);border-radius:10px;padding:12px 16px}
+.info-card h3{margin:0 0 8px;font-size:.92rem}
 
 /* Connectivity */
 .conn-ok  {color:var(--green);font-weight:700}
@@ -3963,17 +4918,45 @@ def _history_bar(ip: str, history: Dict[str, Any]) -> str:
 
 def _build_topology_js(hosts: List[Dict[str, Any]],
                        gateway_ip: Optional[str],
-                       self_ips: Set[str]) -> str:
-    """Build vis.js nodes + edges JSON for the topology tab."""
+                       self_ips: Set[str],
+                       wifi: Optional[Dict[str, Any]] = None,
+                       gw_info: Optional[Dict[str, Any]] = None) -> str:
+    """Build vis.js nodes + edges JSON for the topology tab.
+
+    The gateway node tooltip carries the router's MAC/vendor and — on Wi-Fi —
+    the SSID/BSSID/signal so you can see which AP/router you ride. The
+    self→gateway edge is labelled with the live signal reading.
+    """
     nodes = []
     edges = []
     added_ips: Set[str] = set()
+    wifi = wifi or {}
+    gw_info = gw_info or {}
 
-    # Gateway node
+    # Gateway node — enriched with router/AP detail.
     if gateway_ip:
+        gw_tip_parts = [f"Gateway {gateway_ip}"]
+        if gw_info.get("mac"):
+            gw_tip_parts.append(f"MAC {gw_info['mac']}")
+        if gw_info.get("vendor"):
+            gw_tip_parts.append(gw_info["vendor"])
+        gw_label = f"Gateway\\n{gateway_ip}"
+        if wifi.get("connected"):
+            ssid = wifi.get("ssid") or "Wi-Fi"
+            gw_label = f"📶 {ssid}\\n{gateway_ip}"
+            if wifi.get("bssid"):
+                gw_tip_parts.append(f"BSSID {wifi['bssid']}")
+            if wifi.get("signal_dbm") is not None:
+                gw_tip_parts.append(
+                    f"Signal {wifi['signal_dbm']} dBm"
+                    f"{' (' + wifi['signal_quality'] + ')' if wifi.get('signal_quality') else ''}")
+            if wifi.get("band") or wifi.get("channel"):
+                gw_tip_parts.append(
+                    f"{wifi.get('band') or ''} ch {wifi.get('channel') or '?'}".strip())
         nodes.append({
             "id": "gw",
-            "label": f"Gateway\n{gateway_ip}",
+            "label": gw_label,
+            "title": "\\n".join(gw_tip_parts),
             "shape": "star",
             "color": {"background": "#fbbf24", "border": "#d97706"},
             "font": {"size": 12, "color": "#1e293b"},
@@ -4028,14 +5011,134 @@ def _build_topology_js(hosts: List[Dict[str, Any]],
         })
         added_ips.add(ip)
 
-        # Edge to gateway
+        # Edge to gateway. Highlight our own uplink with the live signal.
         edge_to = "gw" if gateway_ip else None
         if edge_to:
-            edges.append({"from": ip, "to": edge_to,
-                          "color": {"color": "#dde3ec"},
-                          "width": 1.5})
+            edge = {"from": ip, "to": edge_to,
+                    "color": {"color": "#dde3ec"}, "width": 1.5}
+            if is_self and wifi.get("connected"):
+                pct = wifi.get("signal_pct")
+                col = ("#22c55e" if (pct or 0) >= 66 else
+                       "#f59e0b" if (pct or 0) >= 33 else "#ef4444")
+                lbl = "Wi-Fi"
+                if wifi.get("signal_dbm") is not None:
+                    lbl = f"📶 {wifi['signal_dbm']}dBm"
+                edge.update({"color": {"color": col}, "width": 3,
+                             "label": lbl, "dashes": False,
+                             "font": {"size": 10, "color": col,
+                                      "background": "#0f172a"}})
+            edges.append(edge)
 
     return json.dumps({"nodes": nodes, "edges": edges}, ensure_ascii=False)
+
+
+# ── Topology derivations: segments · SPOF · comm edges · graph exports ─────────
+
+def topo_segments(hosts: List[Dict[str, Any]],
+                  local_nets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def subnet_of(ip: str) -> str:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return "other"
+        for net in local_nets or []:
+            try:
+                if addr in ipaddress.ip_network(net.get("cidr"), strict=False):
+                    return net.get("cidr")
+            except Exception:
+                continue
+        return "other"
+    by: Dict[str, List[str]] = {}
+    for h in hosts:
+        by.setdefault(subnet_of(h["ip"]), []).append(h["ip"])
+    return [{"cidr": c, "host_count": len(ips)} for c, ips in sorted(by.items())]
+
+
+def topo_critical_nodes(hosts: List[Dict[str, Any]], gateway: Optional[str],
+                        dns_servers: List[str],
+                        conversations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    crit: Dict[str, Dict[str, Any]] = {}
+    if gateway:
+        crit[gateway] = {"ip": gateway, "reasons": ["default gateway"]}
+    for d in dns_servers or []:
+        if any(h["ip"] == d for h in hosts) or d == gateway:
+            crit.setdefault(d, {"ip": d, "reasons": []})["reasons"].append("DNS resolver")
+    peers: Dict[str, set] = {}
+    for c in conversations or []:
+        peers.setdefault(c["a"], set()).add(c["b"])
+        peers.setdefault(c["b"], set()).add(c["a"])
+    for ip, p in peers.items():
+        if len(p) >= 5:
+            crit.setdefault(ip, {"ip": ip, "reasons": []})["reasons"].append(
+                f"communication hub ({len(p)} peers)")
+    out = list(crit.values())
+    for c in out:
+        c["spof"] = "default gateway" in c["reasons"] or len(c["reasons"]) >= 2
+    return out
+
+
+def topo_comm_edges(hosts: List[Dict[str, Any]],
+                    conversations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    host_ids = {h["ip"] for h in hosts}
+    return [{"from": c["a"], "to": c["b"], "packets": c.get("packets")}
+            for c in (conversations or [])
+            if c["a"] in host_ids and c["b"] in host_ids]
+
+
+def topo_to_mermaid(hosts: List[Dict[str, Any]], gateway: Optional[str],
+                    switches: List[Dict[str, Any]],
+                    comm_edges: List[Dict[str, Any]]) -> str:
+    def nid(x: str) -> str:
+        return "n_" + "".join(ch if ch.isalnum() else "_" for ch in str(x))
+    lines = ["graph TD"]
+    if gateway:
+        lines.append(f'  {nid(gateway)}([Gateway {gateway}])')
+    for h in hosts:
+        label = str(h.get("device_name") or h["ip"]).replace('"', "'")
+        lines.append(f'  {nid(h["ip"])}[{label}]')
+        if gateway and h["ip"] != gateway:
+            lines.append(f'  {nid(gateway)} --> {nid(h["ip"])}')
+    for s in switches or []:
+        sid = "sw_" + str(s.get("system_name") or s.get("chassis_id") or "switch")
+        lines.append(f'  {nid(sid)}{{{{switch {s.get("system_name") or "?"}}}}}')
+        if gateway:
+            lines.append(f'  {nid(sid)} -.-> {nid(gateway)}')
+    for e in comm_edges or []:
+        lines.append(f'  {nid(e["from"])} -.-> {nid(e["to"])}')
+    return "\n".join(lines)
+
+
+def topo_to_dot(hosts: List[Dict[str, Any]], gateway: Optional[str]) -> str:
+    def q(x: str) -> str:
+        return '"' + str(x).replace('"', '\\"') + '"'
+    lines = ["graph omnirecon {", "  layout=neato;", "  node [style=filled];"]
+    for h in hosts:
+        color = "gold" if h["ip"] == gateway else ("lightblue" if h.get("is_self") else "white")
+        lines.append(f'  {q(h["ip"])} [label={q(h.get("device_name") or h["ip"])}, '
+                     f'fillcolor={q(color)}];')
+    for h in hosts:
+        if gateway and h["ip"] != gateway:
+            lines.append(f'  {q(gateway)} -- {q(h["ip"])};')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def topo_to_graphml(hosts: List[Dict[str, Any]], gateway: Optional[str]) -> str:
+    import xml.sax.saxutils as su
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
+             '<key id="label" for="node" attr.name="label" attr.type="string"/>',
+             '<graph edgedefault="undirected">']
+    for h in hosts:
+        parts.append(f'<node id={su.quoteattr(h["ip"])}>'
+                     f'<data key="label">{su.escape(str(h.get("device_name") or h["ip"]))}'
+                     f'</data></node>')
+    for i, h in enumerate(hosts):
+        if gateway and h["ip"] != gateway:
+            parts.append(f'<edge id="e{i}" source={su.quoteattr(gateway)} '
+                         f'target={su.quoteattr(h["ip"])}/>')
+    parts.append('</graph></graphml>')
+    return "\n".join(parts)
 
 
 def render_html(report: Dict[str, Any],
@@ -4482,7 +5585,114 @@ def render_html(report: Dict[str, Any],
     )
 
     # ── Topology ─────────────────────────────────────────────────────────────
-    topo_data = _build_topology_js(hosts, gw, self_ips)
+    wifi = report.get("wifi", {}) or {}
+    neighbors = report.get("neighbors", {}) or {}
+    ip_mac_map, ip_state_map = build_neighbor_maps(neighbors)
+
+    # Consolidated router/gateway picture for the topology.
+    gw_host = next((h for h in hosts if h.get("ip") == gw), None)
+    gw_info = {
+        "ip": gw,
+        "mac": (gw_host or {}).get("mac") or ip_mac_map.get(gw),
+        "vendor": (gw_host or {}).get("vendor"),
+        "device_name": (gw_host or {}).get("device_name"),
+        "arp_state": ip_state_map.get(gw),
+        "uplink": "wireless" if wifi.get("connected") else "wired/unknown",
+    }
+
+    topo_data = _build_topology_js(hosts, gw, self_ips, wifi=wifi, gw_info=gw_info)
+
+    # Router / wireless uplink panel ------------------------------------------
+    def _uplink_rows(pairs):
+        return "".join(
+            f'<tr><td style="color:var(--muted)">{html_escape(k)}</td>'
+            f'<td>{html_escape(v)}</td></tr>'
+            for k, v in pairs if v not in (None, "", "—"))
+
+    router_rows = [
+        ("Gateway IP",       gw or "—"),
+        ("MAC (ARP)",        gw_info["mac"]),
+        ("Vendor",           gw_info["vendor"]),
+        ("Name",             gw_info["device_name"]),
+        ("ARP state",        gw_info["arp_state"]),
+        ("Uplink",           gw_info["uplink"]),
+    ]
+    if wifi.get("connected"):
+        sig = wifi.get("signal_dbm")
+        sig_txt = "—"
+        if sig is not None or wifi.get("signal_pct") is not None:
+            bits = []
+            if sig is not None: bits.append(f"{sig} dBm")
+            if wifi.get("signal_pct") is not None: bits.append(f"{wifi['signal_pct']}%")
+            if wifi.get("signal_quality"): bits.append(f"({wifi['signal_quality']})")
+            sig_txt = " ".join(bits)
+        chan = wifi.get("channel")
+        if chan and wifi.get("channel_width_mhz"):
+            chan = f"{chan} ({wifi['channel_width_mhz']} MHz wide)"
+        rate = None
+        if wifi.get("tx_rate_mbps") or wifi.get("rx_rate_mbps"):
+            rate = f"↑ {wifi.get('tx_rate_mbps') or '—'} / ↓ {wifi.get('rx_rate_mbps') or '—'} Mbps"
+        wifi_rows = [
+            ("SSID",            wifi.get("ssid")),
+            ("BSSID (AP radio)", wifi.get("bssid")),
+            ("Signal",          sig_txt),
+            ("Band",            wifi.get("band")),
+            ("Channel",         chan),
+            ("Frequency",       f"{wifi['frequency_mhz']} MHz" if wifi.get("frequency_mhz") else None),
+            ("PHY / mode",      wifi.get("phy_mode")),
+            ("Security",        wifi.get("security")),
+            ("Link rate",       rate),
+            ("Tx power",        f"{wifi['tx_power_dbm']} dBm" if wifi.get("tx_power_dbm") else None),
+            ("SNR",             f"{wifi['snr_db']} dB" if wifi.get("snr_db") is not None else None),
+            ("Noise",           f"{wifi['noise_dbm']} dBm" if wifi.get("noise_dbm") is not None else None),
+            ("Beacon interval", wifi.get("beacon_interval")),
+            ("DTIM period",     wifi.get("dtim_period")),
+            ("BSS flags",       wifi.get("bss_flags")),
+            ("Interface",       wifi.get("interface")),
+        ]
+        wifi_panel = (
+            '<div class="info-card"><h3>📶 Wireless uplink → '
+            f'{html_escape(wifi.get("ssid") or "router")}</h3>'
+            f'<table class="info-table">{_uplink_rows(wifi_rows)}</table></div>')
+    else:
+        note = "Wired or no wireless link detected."
+        if wifi.get("error"):
+            note += f" ({html_escape(wifi['error'])})"
+        wifi_panel = (f'<div class="info-card"><h3>📶 Wireless uplink</h3>'
+                      f'<p style="color:var(--muted)">{note}</p></div>')
+
+    router_panel = (
+        '<div class="info-card"><h3>🌐 Router / gateway</h3>'
+        f'<table class="info-table">{_uplink_rows(router_rows)}</table></div>')
+
+    uplink_html = (
+        '<div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:16px">'
+        f'{router_panel}{wifi_panel}</div>')
+
+    # ARP / NDP neighbour table ------------------------------------------------
+    nb_list = neighbors.get("neighbors", []) or []
+    if nb_list:
+        nb_rows = []
+        for n in sorted(nb_list, key=lambda x: (x.get("version", 4), str(x.get("ip")))):
+            tag = (' <span style="background:#0d9488;color:#fff;font-size:.66rem;'
+                   'padding:1px 6px;border-radius:8px">gateway</span>'
+                   if n.get("ip") == gw else "")
+            nb_rows.append(
+                f'<tr><td>{html_escape(n.get("ip"))}{tag}</td>'
+                f'<td>{html_escape(n.get("mac") or "—")}</td>'
+                f'<td>IPv{html_escape(n.get("version") or 4)}</td>'
+                f'<td>{html_escape(n.get("interface") or "—")}</td>'
+                f'<td>{html_escape(n.get("state") or "—")}</td></tr>')
+        arp_html = (
+            f'<h3 style="margin-top:18px">🧭 ARP / NDP Neighbours ({len(nb_list)})</h3>'
+            '<div class="tbl-wrap"><table class="host-table"><thead><tr>'
+            '<th>IP Address</th><th>MAC</th><th>Family</th>'
+            '<th>Interface</th><th>State</th></tr></thead>'
+            f'<tbody>{"".join(nb_rows)}</tbody></table></div>')
+    else:
+        arp_html = ('<h3 style="margin-top:18px">🧭 ARP / NDP Neighbours</h3>'
+                    '<p class="empty">No ARP/NDP neighbours recorded.</p>')
+
     topo_legend_items = []
     seen_types: Set[str] = set()
     color_map_js = {
@@ -4503,12 +5713,217 @@ def render_html(report: Dict[str, Any],
                 f'border-radius:50%;background:{col};vertical-align:middle;'
                 f'margin-right:4px"></span>{icon} {html_escape(dt_)}</span>')
 
+    # ── Recon+ blocks (wireless / path / link / anomalies / WAN / BT / EOL) ────
+    def _tbl(headers, rows_html, title, empty="—"):
+        if not rows_html:
+            return ""
+        ths = "".join(f"<th>{html_escape(h)}</th>" for h in headers)
+        return (f'<h3 style="margin-top:18px">{title}</h3>'
+                f'<div class="tbl-wrap"><table class="host-table"><thead><tr>{ths}'
+                f'</tr></thead><tbody>{rows_html}</tbody></table></div>')
+
+    recon_html = ""
+
+    wl = report.get("wireless", {}) or {}
+    aps = wl.get("survey", []) or []
+    if aps:
+        ana = wl.get("analysis", {}) or {}
+        rogue_set = {id(a) for a in (ana.get("rogue_aps") or [])}
+        rows = "".join(
+            f'<tr><td>{html_escape(a.get("ssid") or "—")}'
+            + (' <span style="color:var(--green)">●conn</span>'
+               if a.get("bssid") == (report.get("wifi", {}) or {}).get("bssid") else "")
+            + (' <span style="color:var(--red)">rogue?</span>' if id(a) in rogue_set else "")
+            + f'</td><td>{html_escape(a.get("bssid"))}</td>'
+            f'<td>{html_escape(a.get("vendor") or "")}</td>'
+            f'<td>{html_escape(a.get("signal_dbm"))} dBm</td>'
+            f'<td>{html_escape(a.get("band") or "")} ch{html_escape(a.get("channel") or "?")}</td>'
+            f'<td>{html_escape(a.get("security") or "")}'
+            + ("  ⚠WPS" if a.get("wps") else "") + '</td></tr>'
+            for a in aps)
+        rec = ana.get("recommended_channel_24ghz")
+        hint = (f'<p style="font-size:.8rem;color:var(--muted)">Recommended 2.4 GHz '
+                f'channel: <b>{rec}</b></p>') if rec else ""
+        recon_html += _tbl(["SSID","BSSID","Vendor","Signal","Band/Ch","Security"],
+                           rows, f"📡 Wireless Survey ({len(aps)})") + hint
+
+    lq = report.get("link_quality", {}) or {}
+    if lq:
+        rows = ""
+        for nm, d in (("Gateway", lq.get("gateway")), ("Internet", lq.get("internet"))):
+            if d:
+                rows += (f'<tr><td>{nm} ({html_escape(d.get("ip"))})</td>'
+                         f'<td>{html_escape(d.get("avg_ms"))} ms</td>'
+                         f'<td>{html_escape(d.get("jitter_ms"))} ms</td>'
+                         f'<td>{html_escape(d.get("loss_pct"))}%</td></tr>')
+        recon_html += _tbl(["Target","Avg latency","Jitter","Loss"], rows, "📶 Link Quality")
+
+    path = report.get("path", {}) or {}
+    hops = (path.get("internet") or {}).get("hops", [])
+    if hops:
+        rows = "".join(
+            f'<tr><td>{html_escape(h.get("hop"))}</td>'
+            f'<td>{html_escape(h.get("ip") or "*")}</td>'
+            f'<td>{html_escape(h.get("rtt_ms"))} ms</td>'
+            f'<td>{"private" if h.get("private") else ("public" if h.get("ip") else "—")}</td></tr>'
+            for h in hops)
+        dn = (' <span style="color:var(--amber,#f59e0b)">⚠ double-NAT</span>'
+              if path.get("double_nat") else "")
+        recon_html += _tbl(["Hop","IP","RTT","Scope"], rows,
+                           f"🛰 Network Path — {path.get('hop_count','?')} hops"
+                           f", ISP edge {html_escape(path.get('isp_edge_ip') or '?')}{dn}")
+
+    sw = report.get("l2_neighbors", []) or []
+    if sw:
+        rows = "".join(
+            f'<tr><td>{html_escape(s.get("system_name") or s.get("chassis_id"))}</td>'
+            f'<td>{html_escape(s.get("port_id") or "")}</td>'
+            f'<td>{html_escape(s.get("vlan") or "")}</td>'
+            f'<td>{html_escape(s.get("mgmt_addr") or "")}</td>'
+            f'<td>{html_escape(s.get("protocol"))}</td></tr>' for s in sw)
+        recon_html += _tbl(["Switch","Port","VLAN","Mgmt IP","Proto"], rows,
+                           "🔀 Layer-2 Switches (LLDP/CDP)")
+
+    # Subnet segments
+    segs = topo_segments(hosts, report.get("local_ipv4_networks", []))
+    if len(segs) > 1 or (segs and segs[0]["cidr"] != "other"):
+        rows = "".join(f'<tr><td>{html_escape(s["cidr"])}</td>'
+                       f'<td>{html_escape(s["host_count"])}</td></tr>' for s in segs)
+        recon_html += _tbl(["Subnet","Hosts"], rows, "🗂 Network Segments")
+
+    # VLANs seen passively
+    vlans = (report.get("passive_extras", {}) or {}).get("vlans", [])
+    if vlans:
+        recon_html += (f'<h3 style="margin-top:18px">🏷 VLANs seen</h3>'
+                       f'<p>{html_escape(", ".join(map(str, vlans)))}</p>')
+
+    # Critical nodes / SPOF
+    convs = (report.get("passive_extras", {}) or {}).get("conversations", [])
+    crit = [c for c in topo_critical_nodes(hosts, gw,
+            report.get("dns", {}).get("dns_servers", []), convs) if c.get("spof")]
+    if crit:
+        items = "".join(
+            f'<li>⚠ <b>{html_escape(c["ip"])}</b> — '
+            f'{html_escape(", ".join(c["reasons"]))}</li>' for c in crit)
+        recon_html += (f'<h3 style="margin-top:18px">🎯 Critical Nodes / SPOF</h3>'
+                       f'<ul>{items}</ul>')
+
+    # Observed conversations (passive comm edges)
+    comm = topo_comm_edges(hosts, convs)
+    if comm:
+        rows = "".join(f'<tr><td>{html_escape(c["from"])}</td>'
+                       f'<td>{html_escape(c["to"])}</td>'
+                       f'<td>{html_escape(c.get("packets"))}</td></tr>'
+                       for c in comm[:40])
+        recon_html += _tbl(["A","B","Packets"], rows, "💬 Observed Conversations (passive)")
+
+    # Passive OS fingerprints
+    osfp = (report.get("passive_extras", {}) or {}).get("os_fingerprints", {})
+    if osfp:
+        rows = "".join(f'<tr><td>{html_escape(ip_)}</td><td>{html_escape(g)}</td></tr>'
+                       for ip_, g in osfp.items())
+        recon_html += _tbl(["Host","Passive OS guess"], rows, "🧬 Passive OS Fingerprints")
+
+    # Topology graph export (Mermaid, copy-paste)
+    if hosts:
+        mer = topo_to_mermaid(hosts, gw, sw, comm)
+        recon_html += (f'<details style="margin-top:18px"><summary>🧩 Mermaid graph '
+                       f'(paste into mermaid.live)</summary>'
+                       f'<pre>{html_escape(mer)}</pre></details>')
+
+    anoms = report.get("anomalies", []) or []
+    if anoms:
+        rows = "".join(
+            f'<tr><td>{html_escape(a.get("severity","").upper())}</td>'
+            f'<td><b>{html_escape(a.get("title"))}</b><br>'
+            f'<span style="color:var(--muted)">{html_escape(a.get("detail"))}</span></td></tr>'
+            for a in anoms)
+        recon_html += _tbl(["Severity","Anomaly"], rows, "🚨 Network Anomalies")
+
+    wan = report.get("wan_exposure", {}) or {}
+    if wan.get("igd_found"):
+        rows = "".join(
+            f'<tr><td>{html_escape(m.get("external_port"))}/{html_escape(m.get("protocol"))}</td>'
+            f'<td>{html_escape(m.get("internal_client"))}:{html_escape(m.get("internal_port"))}</td>'
+            f'<td>{html_escape(m.get("description") or "")}</td></tr>'
+            for m in (wan.get("port_mappings") or []))
+        recon_html += (f'<h3 style="margin-top:18px">🌍 WAN Exposure — external IP '
+                       f'{html_escape(wan.get("external_ip") or "?")}</h3>'
+                       + (_tbl(["External","→ Internal","Description"], rows, "")
+                          .replace('<h3 style="margin-top:18px"></h3>', "")
+                          if rows else '<p class="empty">No active port forwards.</p>'))
+
+    bt = report.get("bluetooth", {}) or {}
+    if bt.get("devices"):
+        rows = "".join(
+            f'<tr><td>{html_escape(d.get("address"))}</td>'
+            f'<td>{html_escape(d.get("name") or "—")}</td>'
+            f'<td>{html_escape(d.get("vendor") or "")}</td></tr>'
+            for d in bt["devices"])
+        recon_html += _tbl(["Address","Name","Vendor"], rows,
+                           f"🔵 Bluetooth / BLE ({len(bt['devices'])})")
+
+    lc = (report.get("lifecycle", {}) or {}).get("by_host", {})
+    if lc:
+        rows = ""
+        for ip_, items in lc.items():
+            for it in items:
+                st = ("EOL" if it.get("is_eol") else
+                      "supported" if it.get("is_eol") is False else "?")
+                rows += (f'<tr><td>{html_escape(ip_)}</td>'
+                         f'<td>{html_escape(it.get("product"))} {html_escape(it.get("version"))}</td>'
+                         f'<td>{html_escape(it.get("eol"))}</td><td>{st}</td></tr>')
+        recon_html += _tbl(["Host","Component","EOL date","Status"], rows,
+                           "♻ Software Lifecycle (EOL)")
+
+    # Router / gateway audit
+    ra = report.get("router_audit", {}) or {}
+    if ra.get("admin") or ra.get("findings"):
+        adm = ra.get("admin") or {}
+        rows = "".join(
+            f'<tr><td style="color:var(--muted)">{html_escape(k)}</td><td>{html_escape(v)}</td></tr>'
+            for k, v in [
+                ("Gateway", ra.get("gateway")), ("Admin URL", adm.get("url")),
+                ("Server", adm.get("server")), ("Realm", adm.get("realm")),
+                ("Title", adm.get("title")),
+                ("Default creds accepted",
+                 ", ".join(f"{u}/{p or '<blank>'}" for u, p in ra.get("default_creds", [])) or None)]
+            if v not in (None, ""))
+        recon_html += (f'<h3 style="margin-top:18px">🔐 Router / Gateway Audit</h3>'
+                       f'<table class="info-table">{rows}</table>')
+
+    # Trends over time
+    tr = report.get("trends", {}) or {}
+    tl = tr.get("topology_timeline", {}) or {}
+    sg = tr.get("signal_trend", {}) or {}
+    if tl.get("nodes") or sg.get("series"):
+        bits = f'<p style="color:var(--muted)">{tr.get("scan_count", 0)} scans compared.</p>'
+        if sg.get("delta_db") is not None:
+            arrow = "▼" if sg["trend"] == "degraded" else "▲" if sg["trend"] == "improved" else "▬"
+            bits += (f'<p><b>Wi-Fi signal trend:</b> {arrow} {html_escape(sg["trend"])} '
+                     f'({html_escape(sg.get("baseline_dbm"))} → {html_escape(sg.get("latest_dbm"))} dBm, '
+                     f'Δ {html_escape(sg.get("delta_db"))} dB)</p>')
+        if tl.get("added_last") or tl.get("removed_last"):
+            bits += (f'<p><b>Since last scan:</b> +{len(tl.get("added_last", []))} new, '
+                     f'-{len(tl.get("removed_last", []))} gone</p>')
+        changed = [n for n in tl.get("nodes", []) if n.get("status") in ("new", "left")]
+        if changed:
+            rows = "".join(f'<tr><td>{html_escape(n["ip"])}</td><td>{html_escape(n["status"])}</td>'
+                           f'<td>{html_escape(n["first_seen"])}</td>'
+                           f'<td>{html_escape(int(n["frequency"]*100))}%</td></tr>' for n in changed)
+            bits += ('<table class="host-table"><thead><tr><th>Host</th><th>Status</th>'
+                     f'<th>First seen</th><th>Presence</th></tr></thead><tbody>{rows}</tbody></table>')
+        recon_html += f'<h3 style="margin-top:18px">📈 Trends Over Time</h3>{bits}'
+
     topo_html = (
+        f'{uplink_html}'
         f'<div id="topology-container"></div>'
         f'<p style="font-size:.78rem;color:var(--muted);margin-top:8px">'
-        f'Drag nodes to rearrange. Scroll to zoom. '
-        f'Requires internet connection to load vis.js from CDN.</p>'
+        f'Drag nodes to rearrange. Scroll to zoom. Hover the gateway for '
+        f'router/AP detail. Requires internet connection to load vis.js from CDN.</p>'
         f'<div style="margin-top:8px">{"".join(topo_legend_items)}</div>'
+        f'{arp_html}'
+        f'{recon_html}'
         f'<script>'
         f'(function initTopologyWhenReady() {{'
         f'  if (typeof vis === "undefined") {{ setTimeout(initTopologyWhenReady, 50); return; }}'
@@ -4541,6 +5956,18 @@ def render_html(report: Dict[str, Any],
         raw_block("Routing Table",               report.get("routes",{})),
         raw_block("DNS Configuration",           report.get("dns",{})),
         raw_block("ARP / NDP Neighbour Table",   report.get("neighbors",{})),
+        raw_block("Wi-Fi Uplink",                report.get("wifi",{})),
+        raw_block("Wireless Survey",             report.get("wireless",{})),
+        raw_block("LLDP/CDP Neighbours",         report.get("l2_neighbors",[])),
+        raw_block("Network Path",                report.get("path",{})),
+        raw_block("Link Quality",                report.get("link_quality",{})),
+        raw_block("Network Anomalies",           report.get("anomalies",[])),
+        raw_block("WAN Exposure",                report.get("wan_exposure",{})),
+        raw_block("Bluetooth / BLE",             report.get("bluetooth",{})),
+        raw_block("Software Lifecycle",          report.get("lifecycle",{})),
+        raw_block("Router / Gateway Audit",      report.get("router_audit",{})),
+        raw_block("Trends Over Time",            report.get("trends",{})),
+        raw_block("Passive Extras",              report.get("passive_extras",{})),
         raw_block("Active Connections (sampled)",report.get("active_connections",[])),
         raw_block("Zeroconf Map",                report.get("zeroconf_map",{})),
         raw_block("Change Diff",                 diff or {}),
@@ -4868,6 +6295,33 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Suppress topology tab (useful offline or when CDN blocked).")
     g_intel.add_argument("--no-diff", action="store_true",
                           help="Skip comparison against previous report.")
+    g_intel.add_argument("--lifecycle", action="store_true",
+                          help="Flag end-of-life software versions (endoflife.date).")
+
+    g_rf = ap.add_argument_group("Wireless / Path / Exposure  (v6.1)")
+    g_rf.add_argument("--wireless-survey", action="store_true",
+                       help="Survey nearby APs: channels, rogue/evil-twin, WPS.")
+    g_rf.add_argument("--lldp", action="store_true",
+                       help="Passive LLDP/CDP switch discovery (needs root + scapy).")
+    g_rf.add_argument("--lldp-duration", type=float, default=35.0,
+                       help="Seconds to listen for LLDP/CDP (default 35).")
+    g_rf.add_argument("--traceroute", action="store_true",
+                       help="Map the L3 path to gateway + internet (double-NAT check).")
+    g_rf.add_argument("--link-quality", action="store_true",
+                       help="Latency/jitter/loss to gateway + internet.")
+    g_rf.add_argument("--wan-exposure", action="store_true",
+                       help="Enumerate UPnP IGD port-forwards on the router.")
+    g_rf.add_argument("--bluetooth", action="store_true",
+                       help="Scan nearby Bluetooth/BLE devices.")
+    g_rf.add_argument("--bluetooth-duration", type=float, default=8.0,
+                       help="Seconds to scan Bluetooth (default 8).")
+    g_rf.add_argument("--graph-export", action="store_true",
+                       help="Write topology as .mmd/.dot/.graphml next to the report.")
+    g_rf.add_argument("--pcap", action="store_true",
+                       help="Write a .pcap of the passive capture (with --passive).")
+    g_rf.add_argument("--router-audit", action="store_true",
+                       help="Audit the gateway admin surface (default-cred test "
+                            "needs --i-have-authorization).")
 
     g_pentest = ap.add_argument_group(
         "Penetration Testing  (--help-topic pentest)\n"
@@ -4969,6 +6423,7 @@ def main() -> None:
     print("  [2/8] Routes & DNS …")
     report["routes"] = get_routes_and_gateway()
     report["dns"]    = get_dns_config()
+    report["wifi"]   = get_wifi_info()
     default_iface    = report["routes"].get("default_iface")
     gw               = report["routes"].get("default_gateway")
 
@@ -4987,6 +6442,30 @@ def main() -> None:
     report["local_ipv4_networks"] = local_nets
 
     oui_map = load_oui_map(args.oui_file) if args.oui_file else {}
+
+    # ── [4b] Wireless / path / link / WAN / Bluetooth / anomalies ─────────────
+    if args.wireless_survey:
+        print("  [4b] Wireless survey …")
+        aps = get_wifi_survey(oui_map)
+        report["wireless"] = {"survey": aps,
+                              "analysis": analyze_wifi_survey(aps, report.get("wifi"))}
+    if args.lldp:
+        print(f"  [4b] LLDP/CDP listen ({args.lldp_duration:.0f}s) …")
+        report["l2_neighbors"] = lldp_cdp_listen(args.lldp_duration)
+    if args.traceroute:
+        print("  [4b] Tracing path …")
+        report["path"] = trace_path(gw)
+    if args.link_quality:
+        print("  [4b] Measuring link quality …")
+        report["link_quality"] = measure_link_quality(gw)
+    if args.wan_exposure:
+        print("  [4b] WAN exposure (UPnP IGD) …")
+        report["wan_exposure"] = assess_wan_exposure()
+    if args.bluetooth:
+        print(f"  [4b] Bluetooth scan ({args.bluetooth_duration:.0f}s) …")
+        report["bluetooth"] = scan_bluetooth(args.bluetooth_duration, oui_map)
+    # Anomaly analysis is free — always run it from the ARP table.
+    report["anomalies"] = analyze_anomalies(report["neighbors"], gw)
 
     # ── [5] Zeroconf ──────────────────────────────────────────────────────────
     zc_map: Dict[str, Dict[str, Any]] = {}
@@ -5011,7 +6490,15 @@ def main() -> None:
             duration_s=args.passive_duration,
             interface=args.passive_interface,
             progress=args.progress,
+            capture_pcap=args.pcap,
         )
+        if args.pcap and _HAS_SCAPY and passive_result_obj.pcap:
+            pcap_path = os.path.join(outdir, f"capture_{now_stamp()}.pcap")
+            try:
+                scapy.wrpcap(pcap_path, passive_result_obj.pcap)
+                print(f"    PCAP  →  {pcap_path}")
+            except Exception as e:
+                print(f"    PCAP write failed: {e}")
         # v5: Ping passive-only hosts to trigger ARP exchange for MAC discovery
         if passive_result_obj and len(passive_result_obj.hosts) > 0:
             ping_passive_hosts_for_mac(
@@ -5021,9 +6508,15 @@ def main() -> None:
             )
         passive_list = passive_result_obj.to_list()
         report["passive_observations"] = passive_list
+        report["passive_extras"] = passive_result_obj.extras()
+        # Recompute anomalies now that we may have seen DHCP servers.
+        report["anomalies"] = analyze_anomalies(
+            report["neighbors"], gw,
+            dhcp_servers=report["passive_extras"].get("dhcp_servers"))
     else:
         print("  [6/8] Passive sniffing: skipped  (use --passive or --passive-extended)")
         report["passive_observations"] = []
+        report["passive_extras"] = {}
 
     # ── SSDP ─────────────────────────────────────────────────────────────────
     ssdp_devices: List[Dict[str, Any]] = []
@@ -5180,6 +6673,22 @@ def main() -> None:
 
     report["discovery"] = disc_block
 
+    # ── Software lifecycle (EOL) ──────────────────────────────────────────────
+    if getattr(args, "lifecycle", False) and hosts:
+        print("\n  Software lifecycle (endoflife.date) …")
+        report["lifecycle"] = check_lifecycle(hosts)
+
+    # ── Router / gateway audit ────────────────────────────────────────────────
+    if getattr(args, "router_audit", False):
+        print("\n  Router / gateway audit …")
+        report["router_audit"] = build_router_audit(
+            report, authorized=args.i_have_authorization)
+
+    # ── Trends over time (topology time-lapse + signal trend) ─────────────────
+    prior_reports = load_prior_reports(outdir)
+    if prior_reports:
+        report["trends"] = trends_from_reports(prior_reports + [report])
+
     # ── CVE check ─────────────────────────────────────────────────────────────
     cve_map_result: Dict[str, List[Dict]] = {}
     if args.cve_check and hosts:
@@ -5257,11 +6766,32 @@ def main() -> None:
             ttl_map=ttl_map,
         ))
 
+    # Topology graph exports (Mermaid / DOT / GraphML) for external tools.
+    graph_paths: Dict[str, str] = {}
+    if args.graph_export and hosts:
+        comm_edges = topo_comm_edges(hosts, report.get("passive_extras", {}).get("conversations", []))
+        sw_list = report.get("l2_neighbors", []) or []
+        exporters = {
+            "mmd": lambda: topo_to_mermaid(hosts, gw, sw_list, comm_edges),
+            "dot": lambda: topo_to_dot(hosts, gw),
+            "graphml": lambda: topo_to_graphml(hosts, gw),
+        }
+        for ext, fn in exporters.items():
+            gp = os.path.join(outdir, f"network_report_{stamp}.{ext}")
+            try:
+                with open(gp, "w", encoding="utf-8") as f:
+                    f.write(fn())
+                graph_paths[ext] = gp
+            except Exception:
+                pass
+
     print(f"\n  {'─'*60}")
     print(f"  ✓ Done in {_fmt_elapsed(scan_elapsed)}")
     print(f"\n  Reports saved:")
     print(f"    HTML  →  {html_path}")
     print(f"    JSON  →  {json_path}")
+    for ext, gp in graph_paths.items():
+        print(f"    {ext.upper():5} →  {gp}")
     print(f"    Audit →  {audit_log_path}")
     print(f"  {'─'*60}")
 

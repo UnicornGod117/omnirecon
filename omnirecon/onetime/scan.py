@@ -23,6 +23,22 @@ StageCb = Optional[Callable[[str], None]]
 ProgressCb = Optional[Callable[[int, int], None]]
 
 
+def _load_prior_reports(outdir: str, limit: int = 12) -> List[Dict[str, Any]]:
+    """Load recent scan_*.json reports from outdir (oldest first) for trends."""
+    import glob
+    import json
+    paths = sorted(glob.glob(os.path.join(outdir, "scan_*.json")),
+                   key=lambda p: os.path.getmtime(p))[-limit:]
+    out: List[Dict[str, Any]] = []
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8") as f:
+                out.append(json.load(f))
+        except Exception:
+            continue
+    return out
+
+
 def run_onetime_scan(
     opts: EngineOptions,
     outdir: str,
@@ -51,6 +67,24 @@ def run_onetime_scan(
             from ..engine import hygiene as _hygiene
             report["hygiene"] = _hygiene.analyze(report)
 
+    # Router / gateway audit — active (credential test gated by authorization).
+    if getattr(opts, "router_audit", False):
+        from ..engine import routeraudit
+        report["router_audit"] = routeraudit.assess(report, authorized=authorized,
+                                                    stage_cb=stage_cb)
+        if opts.hygiene and report["router_audit"].get("findings"):
+            from ..engine import hygiene as _hygiene
+            _hygiene.fold_in_findings(report, report["router_audit"]["findings"])
+
+    # Trends over time — topology time-lapse + signal trend from prior reports.
+    try:
+        from ..engine import trends
+        prior = _load_prior_reports(outdir, limit=12)
+        if prior:
+            report["trends"] = trends.from_reports(prior + [report])
+    except Exception:
+        pass
+
     # Active plugins probe hosts over the network — one-time mode only.
     if opts.plugins and hosts:
         if stage_cb:
@@ -70,7 +104,8 @@ def run_onetime_scan(
     html_path, json_path = report_mod.write_reports(report, outdir, prefix="scan")
 
     extra_exports: Dict[str, str] = {}
-    wanted = [f for f in (export or []) if f in ("csv", "md", "pdf")]
+    wanted = [f for f in (export or [])
+              if f in ("csv", "md", "pdf", "mermaid", "dot", "graphml")]
     if wanted:
         if stage_cb:
             stage_cb(f"Exporting {', '.join(wanted)}")

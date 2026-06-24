@@ -196,8 +196,20 @@ The rebuilt engine has full feature parity with the legacy engine:
 | SNMP enrichment (sysName/sysDescr) | `--snmp` |
 | Zeroconf/mDNS browse · SSDP/UPnP discovery | `--zeroconf --ssdp` |
 | Passive sniffing (ARP/mDNS/NetBIOS/SSDP/DHCP/LLMNR) | `--passive` |
+| Passive++: conversation edges · 802.1Q VLANs · rogue-DHCP · OS fingerprint · PCAP | `--passive --pcap` |
 | CVE correlation (NVD + CISA KEV + impact classification, cached) | `--cve` |
-| Topology map | `--topology` |
+| **EOL / lifecycle** (service version → endoflife.date) | `--lifecycle` |
+| Topology map (router/AP uplink · segments · per-AP groups · SPOF · comm edges) | `--topology` |
+| **L2 discovery** (passive LLDP/CDP → switch · port · VLAN · mgmt IP) | `--lldp` |
+| **Path map** (traceroute to gateway + internet · double-NAT detection) | `--traceroute` |
+| **Link quality** (latency · jitter · loss to gateway + internet) | `--link-quality` |
+| **Wireless survey** (all nearby APs · channel use · rogue/evil-twin · WPS) | `--wireless-survey` |
+| **Bluetooth/BLE** device scan | `--bluetooth` |
+| **WAN exposure** (UPnP IGD external IP + port-forward enumeration) | `--wan-exposure` |
+| **Router audit** (admin surface · default-cred test · firmware hint) | `--router-audit` (+`--i-have-authorization`) |
+| **ARP-spoof / MITM + rogue-DHCP anomalies** (folded into hygiene) | automatic |
+| **Trends over time** (topology time-lapse · Wi-Fi signal trend) | automatic (from prior reports) |
+| **Graph exports** (Mermaid · Graphviz DOT · GraphML) | `--export mermaid,dot,graphml` |
 | Pentest: tls-audit · headers · http-vulns · ftp-anon · ssh-defaults · smb-enum | `--pentest <modules> --i-have-authorization` |
 | **Network hygiene findings** (Telnet/FTP/plaintext mgmt · SMB · exposed DB · self-signed/expired/weak TLS · missing rDNS · public DNS · SMBv1) | automatic |
 | **Exposure map + posture grade** (per-host service grouping, A–F score) | automatic |
