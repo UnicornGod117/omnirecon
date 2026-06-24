@@ -91,6 +91,51 @@ python omnirecon.py --discover --subnet 10.0.0.0/24 --allow-non-private --probe-
 
 
 ════════════════════════════════════════════════════════════
+  v6.1 RECON EXPANSION  (wireless · L2 · path · exposure · trends)
+  These enrich the Topology tab and add new report sections.
+════════════════════════════════════════════════════════════
+
+# ── Wireless: connected-AP uplink is automatic; survey all nearby APs ──
+#    Lists every SSID/BSSID, channel use, best-channel pick, rogue/evil-twin, WPS.
+python omnirecon.py --discover --wireless-survey --topology --progress --outdir .\reports
+
+# ── Layer-2 wiring diagram via passive LLDP/CDP (admin/root + scapy) ──
+#    Reveals switch name, the exact port a host plugs into, VLAN, mgmt IP.
+python omnirecon.py --discover --lldp --lldp-duration 45 --topology --progress --outdir .\reports
+
+# ── Path + link health: hops to gateway/internet + latency/jitter/loss ──
+python omnirecon.py --discover --traceroute --link-quality --topology --outdir .\reports
+
+# ── WAN exposure: what UPnP/IGD has opened to the internet on the router ──
+python omnirecon.py --discover --wan-exposure --topology --outdir .\reports
+
+# ── Router/gateway audit (admin surface; default-cred test needs consent) ──
+python omnirecon.py --discover --router-audit --i-have-authorization --outdir .\reports
+
+# ── Bluetooth/BLE device sweep (BlueZ on Linux / system_profiler on macOS) ──
+python omnirecon.py --discover --bluetooth --bluetooth-duration 10 --outdir .\reports
+
+# ── End-of-life software check (service version → endoflife.date) ──
+python omnirecon.py --discover --probe-ports --service-hints --lifecycle --outdir .\reports
+
+# ── Passive++ with PCAP for offline Wireshark analysis (admin/root) ──
+#    Also yields conversation edges, VLANs, rogue-DHCP, passive OS fingerprints.
+python omnirecon.py --discover --passive --passive-duration 90 --pcap --topology --outdir .\reports
+
+# ── Topology graph exports for other tools (Mermaid / DOT / GraphML) ──
+python omnirecon.py --discover --topology --graph-export --outdir .\reports
+
+# ── Trends over time: run repeatedly into the SAME --outdir ──
+#    Each run compares against prior network_report_*.json → topology time-lapse
+#    + Wi-Fi signal trend ("uplink degraded 12 dB"). Nothing extra to enable.
+python omnirecon.py --discover --wireless-survey --topology --outdir .\reports   # run #1
+python omnirecon.py --discover --wireless-survey --topology --outdir .\reports   # run #2 (+trends)
+
+# ── KITCHEN SINK: everything recon (no pentest), admin/root recommended ──
+python omnirecon.py --discover --discovery-mode combined --probe-ports --service-hints --snmp --zeroconf --ssdp --arp-prime --ipv6 --udp-probe --ttl-os --passive --pcap --wireless-survey --lldp --traceroute --link-quality --wan-exposure --router-audit --bluetooth --lifecycle --cve-check --cve-kev --cve-min-score 0.0 --topology --graph-export --i-have-authorization --progress --outdir .\reports
+
+
+════════════════════════════════════════════════════════════
   PENTEST MODULES  (--pentest-modules flag)
 ════════════════════════════════════════════════════════════
 #  all          → run every module below
@@ -119,6 +164,18 @@ python omnirecon.py --discover --cve-check --cve-kev --outdir .\reports
 python omnirecon.py --help-topic pentest
 python omnirecon.py --help-topic cve-check
 python omnirecon.py --help-topic passive
+
+# "Which AP am I on and how strong?" + survey neighbours
+python omnirecon.py --wireless-survey --topology --outdir .\reports
+
+# "Is anyone ARP-spoofing my gateway?" (anomaly check is automatic)
+python omnirecon.py --discover --outdir .\reports   # see the Network Anomalies panel
+
+# "What has my router opened to the internet?"
+python omnirecon.py --wan-exposure --outdir .\reports
+
+# Lite: connected Wi-Fi + tidy ARP table + dup-MAC check (no admin needed)
+python omnirecon_lite.py --discover --outdir .\reports
 
 
 ════════════════════════════════════════════════════════════

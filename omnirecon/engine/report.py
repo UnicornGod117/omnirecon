@@ -605,6 +605,55 @@ def _passive_extras_block(report: Dict[str, Any]) -> str:
     return _section("Passive Fingerprints & VLANs", parts)
 
 
+def _router_audit_block(report: Dict[str, Any]) -> str:
+    ra = report.get("router_audit") or {}
+    admin = ra.get("admin")
+    if not admin and not ra.get("findings"):
+        return ""
+    rows = [
+        ("Gateway", ra.get("gateway")),
+        ("Admin URL", (admin or {}).get("url")),
+        ("Server", (admin or {}).get("server")),
+        ("Auth realm", (admin or {}).get("realm")),
+        ("Title", (admin or {}).get("title")),
+        ("Default creds accepted",
+         ", ".join(f"{u}/{p or '<blank>'}" for u, p in ra.get("default_creds", [])) or None),
+    ]
+    body = "".join(
+        f'<div class="exp-grp"><span class="exp-lbl">{_esc(k)}</span>'
+        f'<span class="exp-svc">{_esc(v)}</span></div>'
+        for k, v in rows if v not in (None, ""))
+    return _section("Router / Gateway Audit",
+        f'<div class="uplink-card">{body}</div>')
+
+
+def _trends_block(report: Dict[str, Any]) -> str:
+    tr = report.get("trends") or {}
+    tl = tr.get("topology_timeline") or {}
+    st = tr.get("signal_trend") or {}
+    if not tl.get("nodes") and not st.get("series"):
+        return ""
+    parts = f'<p class="dim">{_esc(tr.get("scan_count", 0))} scans compared.</p>'
+    if st.get("delta_db") is not None:
+        arrow = "▼" if st["trend"] == "degraded" else "▲" if st["trend"] == "improved" else "▬"
+        parts += (f'<p><b>Wi-Fi signal trend:</b> {arrow} {_esc(st["trend"])} '
+                  f'({_esc(st.get("baseline_dbm"))} → {_esc(st.get("latest_dbm"))} dBm, '
+                  f'Δ {_esc(st.get("delta_db"))} dB over {_esc(st.get("samples"))} samples)</p>')
+    if tl.get("added_last") or tl.get("removed_last"):
+        parts += ('<p><b>Since last scan:</b> '
+                  f'<span class="ok">+{len(tl.get("added_last", []))} new</span>, '
+                  f'<span class="dim">-{len(tl.get("removed_last", []))} gone</span></p>')
+    new_nodes = [n for n in tl.get("nodes", []) if n.get("status") == "new"]
+    if new_nodes:
+        rows = "".join(
+            f'<tr><td class="mono">{_esc(n["ip"])}</td><td>{_esc(n["status"])}</td>'
+            f'<td>{_esc(n["first_seen"])}</td><td>{_esc(int(n["frequency"]*100))}%</td></tr>'
+            for n in tl["nodes"] if n["status"] in ("new", "left"))
+        parts += ('<table><thead><tr><th>Host</th><th>Status</th><th>First seen</th>'
+                  f'<th>Presence</th></tr></thead><tbody>{rows}</tbody></table>')
+    return _section("Trends Over Time", parts)
+
+
 def _exposure_block(report: Dict[str, Any]) -> str:
     by_host = (report.get("hygiene") or {}).get("by_host", {})
     cards = ""
@@ -737,7 +786,8 @@ def render_html(report: Dict[str, Any]) -> str:
         f'{_exposure_block(report)}'
         f'{cve_block}{topo_block}{_neighbors_block(report)}'
         f'{_wireless_block(report)}{_linkqual_block(report)}{_path_block(report)}'
-        f'{_wanexp_block(report)}{_lifecycle_block(report)}{_bluetooth_block(report)}'
+        f'{_wanexp_block(report)}{_router_audit_block(report)}{_lifecycle_block(report)}'
+        f'{_bluetooth_block(report)}{_trends_block(report)}'
         f'{_passive_extras_block(report)}{ssdp_block}{passive_block}{pentest_block}'
         f'{_section("Full Report (JSON)", f"<pre>{_esc(json.dumps(report, indent=2, ensure_ascii=False))}</pre>")}'
         f'<script>{_JS}</script>'

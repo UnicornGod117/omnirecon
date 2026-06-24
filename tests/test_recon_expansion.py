@@ -1,6 +1,6 @@
 """Pure-logic tests for the v7 recon expansion modules (offline, no I/O)."""
 
-from omnirecon.engine import anomaly, lifecycle, pathmap, topology, wireless
+from omnirecon.engine import anomaly, lifecycle, pathmap, topology, trends, wireless
 
 
 # ── wireless ──────────────────────────────────────────────────────────────────
@@ -115,3 +115,33 @@ def test_topology_exports():
     # every export format routes through export()
     for fmt in ("mermaid", "dot", "graphml"):
         assert topology.export(topo, fmt)
+
+
+# ── trends (time-lapse + signal trend) ────────────────────────────────────────
+
+def _reports():
+    return [
+        {"system": {"timestamp_local": "t1"},
+         "discovery": {"hosts": [{"ip": "192.168.1.1"}, {"ip": "192.168.1.2"}]},
+         "wifi": {"signal_dbm": -45}},
+        {"system": {"timestamp_local": "t2"},
+         "discovery": {"hosts": [{"ip": "192.168.1.1"}, {"ip": "192.168.1.2"},
+                                 {"ip": "192.168.1.9"}]},
+         "wifi": {"signal_dbm": -58}},
+    ]
+
+
+def test_trends_timeline_and_signal():
+    out = trends.from_reports(_reports())
+    tl = out["topology_timeline"]
+    assert tl["added_last"] == ["192.168.1.9"]
+    new = [n for n in tl["nodes"] if n["status"] == "new"]
+    assert new and new[0]["ip"] == "192.168.1.9"
+    st = out["signal_trend"]
+    assert st["trend"] == "degraded"
+    assert st["delta_db"] == -13
+
+
+def test_trends_insufficient_signal():
+    out = trends.from_reports(_reports()[:1])
+    assert out["signal_trend"]["trend"] == "insufficient data"

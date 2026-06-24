@@ -49,8 +49,19 @@ and a lite subset in `legacy/omnirecon_lite.py`:
 - **Topology engine** — subnet segments, per-AP client grouping, L2 switch nodes,
   communication edges, critical-node / SPOF inference, and GraphML / DOT / Mermaid
   exports (`scan --export mermaid,dot,graphml`).
+- **Router/gateway audit** — `routeraudit.py`: admin-interface detection,
+  default-credential test (authorization-gated), UPnP exposure, firmware hint.
+- **Trends over time** — `trends.py`: topology time-lapse (new/left/stable nodes)
+  + Wi-Fi signal trend vs baseline, from prior reports (one-time outdir history;
+  legacy `load_history`).
 - New one-time CLI flags: `--wireless-survey --lldp --traceroute --link-quality
-  --wan-exposure --bluetooth --lifecycle --pcap`; legacy mirrors these.
+  --wan-exposure --router-audit --bluetooth --lifecycle --pcap`; legacy mirrors
+  these (+ `--graph-export`). Trends compute automatically from prior reports.
+
+All 22 items from the "Topology & RF" brainstorm are now implemented in both the
+V7 engine and `legacy/omnirecon.py`; the legacy-lite tool carries a kept-lite
+subset (uplink + ARP table + dup-MAC anomaly). READMEs and `legacy/commands.txt`
+updated.
 
 ### Still open (good next lifts)
 

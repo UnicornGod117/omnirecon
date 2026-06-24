@@ -63,6 +63,9 @@ def build_parser(p) -> None:
                    help="latency/jitter/loss to gateway + internet")
     p.add_argument("--wan-exposure", action="store_true",
                    help="enumerate UPnP IGD port-forwards on the router")
+    p.add_argument("--router-audit", action="store_true",
+                   help="audit the gateway admin surface (default-cred test needs "
+                        "--i-have-authorization)")
     # Intelligence
     p.add_argument("--cve", action="store_true", help="correlate CVEs (NVD + CISA KEV)")
     p.add_argument("--cve-min-score", type=float, default=6.0)
@@ -151,6 +154,8 @@ def cmd_scan(args) -> None:
         traceroute=args.traceroute,
         link_quality=args.link_quality,
         wan_exposure=args.wan_exposure,
+        router_audit=args.router_audit,
+        authorized=args.i_have_authorization,
         cve=args.cve,
         cve_min_score=args.cve_min_score,
         lifecycle=args.lifecycle,

@@ -67,6 +67,8 @@ class EngineOptions:
     traceroute: bool = False              # path map to gateway + internet
     link_quality: bool = False            # latency/jitter/loss to gw + internet
     wan_exposure: bool = False            # UPnP IGD port-forward enumeration
+    router_audit: bool = False            # gateway admin-surface + default-cred audit
+    authorized: bool = False              # consent for active checks (router cred test)
     # Intelligence
     cve: bool = False
     cve_min_score: float = 6.0
