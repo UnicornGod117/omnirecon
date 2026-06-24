@@ -354,6 +354,117 @@ def get_neighbor_table() -> Dict[str, Any]:
     return out
 
 
+def get_wifi_info() -> Dict[str, Any]:
+    """Lite connected-AP info: SSID/BSSID/signal/band/channel. No deps."""
+    info: Dict[str, Any] = {"connected": False}
+
+    def band(mhz):
+        if not mhz:
+            return None
+        return ("2.4 GHz" if 2400 <= mhz < 2500 else
+                "5 GHz" if 4900 <= mhz < 5900 else
+                "6 GHz" if 5925 <= mhz <= 7125 else None)
+
+    try:
+        if is_windows():
+            raw = safe_run(["netsh", "wlan", "show", "interfaces"], timeout=10)
+            f = {}
+            for line in (raw.get("stdout") or "").splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    f[k.strip().lower()] = v.strip()
+            if f.get("state", "").lower() == "connected" or f.get("bssid"):
+                info.update({"connected": True, "ssid": f.get("ssid"),
+                             "bssid": (f.get("bssid") or "").lower() or None,
+                             "security": f.get("authentication"),
+                             "phy_mode": f.get("radio type")})
+                m = re.search(r"(\d+)", f.get("signal", ""))
+                if m:
+                    info["signal_pct"] = int(m.group(1))
+                    info["signal_dbm"] = int(int(m.group(1)) / 2 - 100)
+                if f.get("channel", "").isdigit():
+                    info["channel"] = int(f["channel"])
+        elif is_macos():
+            airport = ("/System/Library/PrivateFrameworks/Apple80211.framework/"
+                       "Versions/Current/Resources/airport")
+            raw = safe_run([airport, "-I"], timeout=8)
+            f = {}
+            for line in (raw.get("stdout") or "").splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    f[k.strip().lower()] = v.strip()
+            if f.get("ssid") or f.get("bssid"):
+                info.update({"connected": True, "ssid": f.get("ssid"),
+                             "bssid": (f.get("bssid") or "").lower() or None})
+                if f.get("agrctlrssi", "").lstrip("-").isdigit():
+                    info["signal_dbm"] = int(f["agrctlrssi"])
+                cm = re.match(r"(\d+)", f.get("channel", ""))
+                if cm:
+                    info["channel"] = int(cm.group(1))
+        elif is_linux():
+            raw = safe_run(["iw", "dev"], timeout=6)
+            iface = None
+            for line in (raw.get("stdout") or "").splitlines():
+                m = re.search(r"^\s*Interface\s+(\S+)", line)
+                if m:
+                    iface = m.group(1)
+                    break
+            if iface:
+                link = safe_run(["iw", "dev", iface, "link"], timeout=6)
+                out = link.get("stdout") or ""
+                if out.strip() and "Not connected" not in out:
+                    info["connected"] = True
+                    info["interface"] = iface
+                    for key, pat, cast in (
+                        ("bssid", r"Connected to ([0-9a-f:]{17})", str),
+                        ("ssid", r"\bSSID:\s*(.+)", str),
+                        ("frequency_mhz", r"\bfreq:\s*(\d+)", int),
+                        ("signal_dbm", r"\bsignal:\s*(-?\d+)\s*dBm", int)):
+                        mm = re.search(pat, out, re.I)
+                        if mm:
+                            info[key] = cast(mm.group(1).strip()) if cast is not str else mm.group(1).strip()
+                    if info.get("bssid"):
+                        info["bssid"] = info["bssid"].lower()
+            if not info.get("ssid"):
+                nm = safe_run(["nmcli", "-t", "-f", "ACTIVE,SSID,BSSID,FREQ,SIGNAL",
+                               "device", "wifi"], timeout=8)
+                for line in (nm.get("stdout") or "").splitlines():
+                    if line.startswith("yes:"):
+                        parts = [p.replace("\\:", ":") for p in re.split(r"(?<!\\):", line)]
+                        if len(parts) >= 5:
+                            info["connected"] = True
+                            info.setdefault("ssid", parts[1] or None)
+                            info.setdefault("bssid", (parts[2] or "").lower() or None)
+                            if parts[4].isdigit():
+                                info.setdefault("signal_pct", int(parts[4]))
+                        break
+    except Exception as e:
+        info["error"] = repr(e)
+    if info.get("band") is None:
+        info["band"] = band(info.get("frequency_mhz"))
+    return info
+
+
+def analyze_anomalies(neighbors: Dict[str, Any], gateway: Optional[str]) -> List[Dict[str, Any]]:
+    """Lite ARP-spoof check: one MAC claiming multiple IPs."""
+    findings = []
+    mac_to_ips: Dict[str, set] = {}
+    for n in neighbors.get("neighbors", []):
+        mac = (n.get("mac") or "").lower()
+        ip = n.get("ip")
+        if mac and ip:
+            mac_to_ips.setdefault(mac, set()).add(ip)
+    for mac, ips in mac_to_ips.items():
+        if mac in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+            continue
+        if len(ips) > 1:
+            sev = "high" if gateway in ips else "medium"
+            findings.append({"severity": sev,
+                             "title": "One MAC claims multiple IPs",
+                             "detail": f"MAC {mac} → {sorted(ips)} (possible ARP spoofing)."})
+    return findings
+
+
 def get_local_ipv4_networks() -> List[Dict[str, Any]]:
     nets = []
     addrs = psutil.net_if_addrs()
@@ -524,7 +635,40 @@ def render_html(report: Dict[str, Any]) -> str:
         f"<li><b>Default gateway</b>: {html_escape(str(gw))}</li>",
         f"<li><b>Public IP</b>: {html_escape(str(pub.get('public_ip')))} (via {html_escape(str(pub.get('service')))})</li>",
     ]
+    wifi = report.get("wifi", {}) or {}
+    if wifi.get("connected"):
+        summary_items.append(
+            f"<li><b>Wi-Fi</b>: {html_escape(wifi.get('ssid') or '?')} "
+            f"(BSSID {html_escape(wifi.get('bssid') or '?')}, "
+            f"{html_escape(str(wifi.get('signal_dbm')))} dBm, "
+            f"{html_escape(wifi.get('band') or '?')} ch{html_escape(wifi.get('channel') or '?')})</li>")
     summary = "<ul>" + "\n".join(summary_items) + "</ul>"
+
+    # ARP / NDP neighbour table (tidied from the raw dump)
+    nbs = report.get("neighbors", {}).get("neighbors", []) or []
+    if nbs:
+        nb_rows = "".join(
+            "<tr>"
+            f"<td>{html_escape(n.get('ip',''))}"
+            + (" <b>(gateway)</b>" if n.get('ip') == gw else "")
+            + f"</td><td>{html_escape(n.get('mac') or '—')}</td>"
+            f"<td>{html_escape(n.get('interface') or '—')}</td>"
+            f"<td>{html_escape(n.get('state') or '—')}</td></tr>"
+            for n in nbs)
+        arp_table = ("<table><thead><tr><th>IP</th><th>MAC</th><th>Interface</th>"
+                     f"<th>State</th></tr></thead><tbody>{nb_rows}</tbody></table>")
+    else:
+        arp_table = "<p>No ARP/NDP neighbours recorded.</p>"
+
+    # Anomalies (lite ARP-spoof check)
+    anoms = report.get("anomalies", []) or []
+    if anoms:
+        anom_html = "<ul>" + "".join(
+            f"<li><b>[{html_escape(a.get('severity','').upper())}]</b> "
+            f"{html_escape(a.get('title'))} — {html_escape(a.get('detail'))}</li>"
+            for a in anoms) + "</ul>"
+    else:
+        anom_html = "<p>No ARP anomalies detected. ✓</p>"
 
     # Host discovery table
     hosts = report.get("discovery", {}).get("hosts", [])
@@ -575,7 +719,8 @@ def render_html(report: Dict[str, Any]) -> str:
 {section("Routing & default gateway (raw)", pre(report.get("routes", {})))}
 {section("DNS configuration (raw + parsed)", pre(report.get("dns", {})))}
 {section("Connectivity checks", pre(report.get("connectivity", {})))}
-{section("Neighbor table (ARP / NDP)", pre(report.get("neighbors", {})))}
+{section("Network anomalies", anom_html)}
+{section("Neighbor table (ARP / NDP)", arp_table)}
 {section("Host discovery", host_table)}
 {section("Listening ports on this device", pre(report.get("listening_ports", [])))}
 {section("Active connections (sampled)", pre(report.get("active_connections", [])))}
@@ -622,8 +767,10 @@ def main():
     report["routes"] = get_routes_and_gateway()
     report["dns"] = get_dns_config()
     report["neighbors"] = get_neighbor_table()
+    report["wifi"] = get_wifi_info()
 
     gw = report["routes"].get("default_gateway")
+    report["anomalies"] = analyze_anomalies(report["neighbors"], gw)
     report["connectivity"] = connectivity_checks(gw)
 
     report["listening_ports"] = get_listening_ports()

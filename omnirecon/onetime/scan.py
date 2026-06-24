@@ -70,7 +70,8 @@ def run_onetime_scan(
     html_path, json_path = report_mod.write_reports(report, outdir, prefix="scan")
 
     extra_exports: Dict[str, str] = {}
-    wanted = [f for f in (export or []) if f in ("csv", "md", "pdf")]
+    wanted = [f for f in (export or [])
+              if f in ("csv", "md", "pdf", "mermaid", "dot", "graphml")]
     if wanted:
         if stage_cb:
             stage_cb(f"Exporting {', '.join(wanted)}")

@@ -23,6 +23,35 @@ Already shipped in the current build (`omnirecon/` + `web/` + `lite/`):
 - **PDF export** — `report.write_pdf` via WeasyPrint (falls back to a `wkhtmltopdf` binary); `--export pdf`.
 - **Test suite** — `tests/` (offline pytest) covering hygiene, reporting, plugins, rules, alerts, scheduling, and external-intel logic; `pyproject.toml` with optional-dependency extras.
 
+### Topology & RF — next wave (delivered)
+
+Shipped across the V7 engine (`omnirecon/engine/`), the frozen `legacy/omnirecon.py`,
+and a lite subset in `legacy/omnirecon_lite.py`:
+
+- **Router/AP uplink intel** — `netinfo.get_wifi_info()`: SSID, BSSID, RSSI/quality,
+  band/channel/width, PHY, security, tx/rx rates, SNR, beacon/DTIM/BSS flags. The
+  topology gateway node + self→gateway edge carry the live signal.
+- **Wireless survey + RF analysis** — `wireless.py`: surveys all nearby APs
+  (nmcli/iw/netsh/airport), per-channel utilization, best-2.4GHz-channel pick,
+  rogue/evil-twin detection, WPS + weak-security findings.
+- **Layer-2 discovery** — `l2disc.py`: passive LLDP/CDP listener → switch name,
+  port, VLAN, mgmt IP (real wiring diagram).
+- **Path mapping** — `pathmap.py`: traceroute to gateway + internet, double-NAT
+  detection, ISP-edge identification.
+- **Link quality** — `linkqual.py`: latency / jitter / loss to gateway + internet.
+- **Anomaly analysis** — `anomaly.py` (pure, folded into hygiene): ARP-spoof /
+  MITM (duplicate MAC, gateway-MAC change), rogue DHCP.
+- **WAN exposure** — `wanexp.py`: UPnP IGD external IP + port-forward enumeration.
+- **Bluetooth/BLE** — `bluetooth.py`: nearby BT device discovery.
+- **Software lifecycle** — `lifecycle.py`: service version → endoflife.date EOL flags.
+- **Passive++** — conversations (who-talks-to-whom edges), 802.1Q VLANs, rogue-DHCP
+  servers, passive OS fingerprint, and PCAP export.
+- **Topology engine** — subnet segments, per-AP client grouping, L2 switch nodes,
+  communication edges, critical-node / SPOF inference, and GraphML / DOT / Mermaid
+  exports (`scan --export mermaid,dot,graphml`).
+- New one-time CLI flags: `--wireless-survey --lldp --traceroute --link-quality
+  --wan-exposure --bluetooth --lifecycle --pcap`; legacy mirrors these.
+
 ### Still open (good next lifts)
 
 - **Docker image & CI** — official container with optional deps pre-installed; wire `pytest` + `bandit` + `mypy` into CI.

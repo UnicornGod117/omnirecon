@@ -42,6 +42,13 @@ class PassiveResult:
         self._lock = threading.Lock()
         self.hosts: Dict[str, Dict[str, Any]] = {}
         self.packet_counts: Dict[str, int] = {}
+        # Extended passive intel.
+        self.conversations: Dict[Tuple[str, str], int] = {}
+        self.vlans: set = set()
+        self.dhcp_servers: set = set()
+        self.os_fingerprints: Dict[str, str] = {}
+        self.pcap: List[Any] = []
+        self.capture_pcap: bool = False
 
     def _ensure(self, ip: str) -> Dict[str, Any]:
         if ip not in self.hosts:
@@ -65,14 +72,56 @@ class PassiveResult:
                 h["protocols"].add(protocol)
             self.packet_counts[ip] = self.packet_counts.get(ip, 0) + 1
 
+    def observe_conversation(self, src: str, dst: str) -> None:
+        if not (is_private_or_lan_ip(src) and is_private_or_lan_ip(dst)) or src == dst:
+            return
+        key = tuple(sorted((src, dst)))
+        with self._lock:
+            self.conversations[key] = self.conversations.get(key, 0) + 1
+
+    def observe_vlan(self, vlan_id: int) -> None:
+        if vlan_id:
+            with self._lock:
+                self.vlans.add(int(vlan_id))
+
+    def observe_dhcp_server(self, ip: str) -> None:
+        if ip and is_private_or_lan_ip(ip):
+            with self._lock:
+                self.dhcp_servers.add(ip)
+
+    def observe_osfp(self, ip: str, guess: str) -> None:
+        if ip and guess:
+            with self._lock:
+                self.os_fingerprints.setdefault(ip, guess)
+
     def to_list(self) -> List[Dict[str, Any]]:
         with self._lock:
             out = [{
                 "ip": ip, "mac": h["mac"], "names": sorted(h["names"]),
                 "services": sorted(h["services"]), "protocols": sorted(h["protocols"]),
                 "packet_count": self.packet_counts.get(ip, 0),
+                "os_fingerprint": self.os_fingerprints.get(ip),
             } for ip, h in self.hosts.items()]
         return sorted(out, key=lambda x: ip_sort_key(x["ip"]))
+
+    def conversation_list(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return sorted(
+                ({"a": a, "b": b, "packets": n}
+                 for (a, b), n in self.conversations.items()),
+                key=lambda c: c["packets"], reverse=True)
+
+    def extras(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "conversations": sorted(
+                    ({"a": a, "b": b, "packets": n}
+                     for (a, b), n in self.conversations.items()),
+                    key=lambda c: c["packets"], reverse=True),
+                "vlans": sorted(self.vlans),
+                "dhcp_servers": sorted(self.dhcp_servers),
+                "os_fingerprints": dict(self.os_fingerprints),
+            }
 
 
 # ── DNS name decoding (shared by mDNS / LLMNR) ────────────────────────────────
@@ -213,10 +262,10 @@ def _handle_dhcp(pkt: Any, result: PassiveResult) -> None:
     src_ip = pkt[scapy.IP].src
     try:
         raw = bytes(pkt[scapy.UDP].payload)
-        if len(raw) < 240 or raw[:4] != b"\x01\x01\x06\x00":
+        if len(raw) < 240 or raw[236:240] != b"\x63\x82\x53\x63":
             return
-        if raw[236:240] != b"\x63\x82\x53\x63":
-            return
+        op = raw[0]
+        msg_type = None
         i = 240
         while i < len(raw) - 1:
             opt = raw[i]; i += 1
@@ -230,10 +279,60 @@ def _handle_dhcp(pkt: Any, result: PassiveResult) -> None:
             if i + length > len(raw):
                 break
             data = raw[i:i + length]; i += length
-            if opt == 12:
+            if opt == 12:  # hostname (in BOOTP requests)
                 hostname = data.decode("utf-8", "ignore").strip()
-                if hostname:
+                if hostname and op == 1:
                     result.observe(src_ip, name=hostname, protocol="DHCP")
+            elif opt == 53 and length == 1:  # DHCP message type
+                msg_type = data[0]
+        # OFFER (2) / ACK (5) come *from* a DHCP server — track the source.
+        if msg_type in (2, 5):
+            result.observe_dhcp_server(src_ip)
+    except Exception:
+        pass
+
+
+def _handle_conversation(pkt: Any, result: PassiveResult) -> None:
+    if pkt.haslayer(scapy.IP):
+        try:
+            result.observe_conversation(pkt[scapy.IP].src, pkt[scapy.IP].dst)
+        except Exception:
+            pass
+
+
+def _handle_vlan(pkt: Any, result: PassiveResult) -> None:
+    if pkt.haslayer(scapy.Dot1Q):
+        try:
+            result.observe_vlan(int(pkt[scapy.Dot1Q].vlan))
+        except Exception:
+            pass
+
+
+# Passive OS fingerprint from the SYN packet's IP-TTL + TCP window size.
+_OSFP_TABLE = [
+    (64, 64240, "Linux"), (64, 65535, "Linux/Android"),
+    (128, 65535, "Windows"), (128, 8192, "Windows"),
+    (255, 4128, "Cisco/Network gear"), (64, 5840, "Linux (older)"),
+]
+
+
+def _handle_osfp(pkt: Any, result: PassiveResult) -> None:
+    if not (pkt.haslayer(scapy.IP) and pkt.haslayer(scapy.TCP)):
+        return
+    try:
+        tcp = pkt[scapy.TCP]
+        if tcp.flags & 0x02 and not (tcp.flags & 0x10):  # SYN, not SYN/ACK
+            ttl = int(pkt[scapy.IP].ttl)
+            win = int(tcp.window)
+            # Round TTL up to the nearest common initial value.
+            init_ttl = 64 if ttl <= 64 else 128 if ttl <= 128 else 255
+            guess = next((os_ for t, w, os_ in _OSFP_TABLE
+                          if t == init_ttl and w == win), None)
+            if not guess:
+                guess = {64: "Linux/Unix", 128: "Windows",
+                         255: "Network gear"}.get(init_ttl)
+            if guess:
+                result.observe_osfp(pkt[scapy.IP].src, guess)
     except Exception:
         pass
 
@@ -260,9 +359,13 @@ def _handle_llmnr(pkt: Any, result: PassiveResult) -> None:
 
 
 def sniff(duration_s: float, interface: Optional[str] = None,
-          stage_cb=None) -> PassiveResult:
-    """Capture for duration_s seconds, harvesting passive observations."""
+          stage_cb=None, capture_pcap: bool = False) -> PassiveResult:
+    """Capture for duration_s seconds, harvesting passive observations.
+
+    With capture_pcap=True, raw frames are retained so the caller can write a
+    .pcap for offline Wireshark analysis (see write_pcap)."""
     result = PassiveResult()
+    result.capture_pcap = capture_pcap
     ok, _ = available()
     if not ok:
         return result
@@ -278,13 +381,29 @@ def sniff(duration_s: float, interface: Optional[str] = None,
             _handle_ssdp(pkt, result)
             _handle_dhcp(pkt, result)
             _handle_llmnr(pkt, result)
+            _handle_conversation(pkt, result)
+            _handle_vlan(pkt, result)
+            _handle_osfp(pkt, result)
+            if capture_pcap:
+                result.pcap.append(pkt)
         except Exception:
             pass
 
     try:
         kwargs = {"iface": interface} if interface else {}
-        scapy.sniff(prn=handle, timeout=duration_s, store=False,
-                    filter="arp or udp or (ip and icmp)", **kwargs)
+        # Broader filter so we also see TCP SYNs (OS fingerprint) + conversations.
+        scapy.sniff(prn=handle, timeout=duration_s, store=False, **kwargs)
     except Exception:
         pass
     return result
+
+
+def write_pcap(result: PassiveResult, path: str) -> Optional[str]:
+    """Write captured frames to a .pcap. Returns the path, or None if empty."""
+    if not _HAS_SCAPY or not getattr(result, "pcap", None):
+        return None
+    try:
+        scapy.wrpcap(path, result.pcap)
+        return path
+    except Exception:
+        return None

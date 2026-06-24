@@ -14,6 +14,7 @@ import sys
 from typing import List
 
 from ..engine import DEFAULT_PORTS, EngineOptions
+from ..engine.primitives import now_stamp
 from .pentest import ALL_MODULES
 from .scan import run_onetime_scan
 
@@ -44,9 +45,29 @@ def build_parser(p) -> None:
     p.add_argument("--ssdp", action="store_true", help="SSDP/UPnP discovery")
     p.add_argument("--passive", action="store_true", help="passive sniff (needs root + scapy)")
     p.add_argument("--passive-duration", type=float, default=20.0)
+    p.add_argument("--pcap", action="store_true",
+                   help="write a .pcap of the passive capture (with --passive)")
+    # Wireless / RF
+    p.add_argument("--wireless-survey", action="store_true",
+                   help="survey nearby APs (channels, rogue/evil-twin, WPS)")
+    p.add_argument("--bluetooth", action="store_true",
+                   help="scan nearby Bluetooth/BLE devices")
+    p.add_argument("--bluetooth-duration", type=float, default=8.0)
+    # Layer-2 / path / link
+    p.add_argument("--lldp", action="store_true",
+                   help="passive LLDP/CDP switch discovery (needs root + scapy)")
+    p.add_argument("--lldp-duration", type=float, default=35.0)
+    p.add_argument("--traceroute", action="store_true",
+                   help="map the L3 path to gateway + internet (double-NAT check)")
+    p.add_argument("--link-quality", action="store_true",
+                   help="latency/jitter/loss to gateway + internet")
+    p.add_argument("--wan-exposure", action="store_true",
+                   help="enumerate UPnP IGD port-forwards on the router")
     # Intelligence
     p.add_argument("--cve", action="store_true", help="correlate CVEs (NVD + CISA KEV)")
     p.add_argument("--cve-min-score", type=float, default=6.0)
+    p.add_argument("--lifecycle", action="store_true",
+                   help="flag end-of-life software versions (endoflife.date)")
     p.add_argument("--topology", action="store_true", help="build topology map")
     p.add_argument("--extintel", action="store_true",
                    help="external intel: Shodan/Censys/VirusTotal (needs API keys)")
@@ -69,7 +90,7 @@ def build_parser(p) -> None:
     p.add_argument("--save", action="store_true",
                    help="record this run into the monitor store (seed a baseline)")
     p.add_argument("--export", metavar="FORMATS", default="",
-                   help="extra report formats, comma-separated: csv,md,pdf")
+                   help="extra formats, comma-separated: csv,md,pdf,mermaid,dot,graphml")
     p.add_argument("--tags-file", metavar="PATH", default=None,
                    help="asset tags file (role/owner annotations)")
     p.add_argument("--outdir", default=_DEFAULT_OUT, metavar="DIR")
@@ -119,8 +140,20 @@ def cmd_scan(args) -> None:
         ssdp=args.ssdp,
         passive=args.passive,
         passive_duration=args.passive_duration,
+        pcap=args.pcap,
+        pcap_path=(os.path.join(args.outdir, f"capture_{now_stamp()}.pcap")
+                   if args.pcap else None),
+        wireless_survey=args.wireless_survey,
+        bluetooth=args.bluetooth,
+        bluetooth_duration=args.bluetooth_duration,
+        lldp=args.lldp,
+        lldp_duration=args.lldp_duration,
+        traceroute=args.traceroute,
+        link_quality=args.link_quality,
+        wan_exposure=args.wan_exposure,
         cve=args.cve,
         cve_min_score=args.cve_min_score,
+        lifecycle=args.lifecycle,
         topology=args.topology,
         tags_file=args.tags_file,
         extintel=args.extintel,
